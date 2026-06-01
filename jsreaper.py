@@ -490,8 +490,8 @@ SENSITIVE_PATTERNS = {
         (r'aws[_\-]?access[_\-]?key[_\-]?id[\s]*[=:]\s*["\']?([A-Z0-9]{20})["\']?',      "critical"),
         (r'aws[_\-]?secret[_\-]?access[_\-]?key[\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?', "critical"),
         (r'aws[_\-]?session[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{100,})["\']?',   "critical"),
-        (r'amazonaws\.com',                                                      "info"),
-        (r's3\.amazonaws\.com/([A-Za-z0-9_\-\.]+)',                             "medium"),
+        # amazonaws.com alone removed — noise. Only actual keys are reported.
+        (r's3\.amazonaws\.com/([A-Za-z0-9_\-\.]{4,})',                          "low"),   # bucket name ref — low until verified accessible
     ],
 
     "Authentication & Passwords": [
@@ -536,18 +536,20 @@ SENSITIVE_PATTERNS = {
     ],
 
     "Sensitive Endpoints & Paths": [
-        (r'["\']/?admin["\'/]',                 "medium"),
-        (r'["\']/?api/v[0-9]+[/"\'a-zA-Z]',    "info"),
-        (r'["\']/?internal[/"\'a-zA-Z]',        "medium"),
-        (r'["\']/?debug[/"\'a-zA-Z]',           "medium"),
-        (r'["\']/?swagger[/"\'a-zA-Z]',         "medium"),
-        (r'["\']/?graphql[/"\'a-zA-Z]',         "medium"),
-        (r'["\']/?\.git[/"\'a-zA-Z]',           "high"),
-        (r'["\']/?\.env[/"\'a-zA-Z]',           "high"),
-        (r'["\']/?backup[s]?[/"\'a-zA-Z]',      "medium"),
-        (r'["\']/?phpmyadmin[/"\'a-zA-Z]',      "high"),
-        (r'/etc/passwd',                         "critical"),
-        (r'/etc/shadow',                         "critical"),
+        # INFO by default — a path string in JS is NOT a finding.
+        # Use --verify to probe these and upgrade confirmed ones.
+        (r'["\']/?admin["\'/]',                "info"),
+        (r'["\']/?api/v[0-9]+[/"\' a-zA-Z]',  "info"),
+        (r'["\']/?internal[/"\' a-zA-Z]',      "info"),
+        (r'["\']/?debug[/"\' a-zA-Z]',         "info"),
+        (r'["\']/?swagger[/"\' a-zA-Z]',       "info"),
+        (r'["\']/?graphql[/"\' a-zA-Z]',       "info"),
+        (r'["\']/?[.]git[/"\' a-zA-Z]',        "medium"),
+        (r'["\']/?[.]env[/"\' a-zA-Z]',        "medium"),
+        (r'["\']/?backup[s]?[/"\' a-zA-Z]',   "info"),
+        (r'["\']/?phpmyadmin[/"\' a-zA-Z]',   "medium"),
+        (r'/etc/passwd',                            "critical"),
+        (r'/etc/shadow',                            "critical"),
     ],
 
     # High-impact vulnerability INDICATORS (static analysis — not active testing)
@@ -581,19 +583,28 @@ SENSITIVE_PATTERNS = {
     ],
 
     "OWASP / Security Issues": [
-        (r'eval\s*\(',                                              "high"),
-        (r'innerHTML\s*=',                                          "medium"),
-        (r'document\.write\s*\(',                                   "medium"),
-        (r'\.dangerouslySetInnerHTML',                              "medium"),
-        (r'localStorage\.setItem\s*\(',                             "info"),
-        (r'sessionStorage\.setItem\s*\(',                           "info"),
-        (r'console\.(log|error|warn|info)\s*\(.*?(pass|key|secret|token|auth)', "medium"),
-        (r'debugger;',                                              "info"),
-        (r'window\.location\s*=\s*[^;]+\+',                        "medium"),
-        (r'cors[\s]*[=:]\s*["\']?\*["\']?',                        "medium"),
-        (r'Access-Control-Allow-Origin["\s:]*\*',                   "medium"),
-        (r'document\.cookie',                                       "medium"),
-        (r'\.src\s*=\s*[^;]*\+',                                   "medium"),
+        # eval() only matters if it takes user-controlled input
+        # bare eval() in minified/library code is common and usually safe
+        (r'eval\s*\(\s*(?!function|\()',                   "medium"),  # eval() with non-function arg
+        # innerHTML is only dangerous with user input — alone it is INFO
+                (r'innerHTML\s*=\s*[^"\'][^;]{0,80}(?:req|param|location|hash|search|input|user)', "high"),  # XSS: user input → innerHTML
+        (r'innerHTML\s*=',                                  "info"),    # generic — needs context
+        (r'document\.write\s*\(',                          "info"),    # common in old code, not always vuln
+        (r'\.dangerouslySetInnerHTML',                     "medium"),  # React XSS risk
+        (r'localStorage\.setItem\s*\(',                   "info"),
+        (r'sessionStorage\.setItem\s*\(',                 "info"),
+        # console.log with sensitive keywords is worth noting
+        (r'console\.(?:log|error|warn|info)\s*\(.*?(?:password|passwd|secret|private_key|access_key)', "medium"),
+        (r'debugger;',                                      "info"),
+        # open redirect only if URL comes from user input
+        (r'window\.location\s*=\s*[^;]+(?:param|req|input|location\.search|hash)', "high"),
+        (r'window\.location\s*=',                         "info"),    # without user input context = info
+        # CORS wildcard is a real finding
+        (r'Access-Control-Allow-Origin["\'\s:]*\*',        "medium"),
+        (r'document\.cookie',                              "info"),    # access alone is not vuln
+        # dynamic src with user input = real finding
+        (r'\.src\s*=\s*[^;]*(?:param|req|input|location|hash)', "high"),
+        (r'\.src\s*=\s*[^;]*\+',                        "info"),    # concatenation but no clear user input
     ],
 
     "Internal Infrastructure": [
@@ -616,15 +627,19 @@ SENSITIVE_PATTERNS = {
     ],
 
     "Crypto & Hashing": [
-        (r'md5\s*\(',    "medium"),
-        (r'sha1\s*\(',   "low"),
-        (r'btoa\s*\(',   "medium"),
-        (r'atob\s*\(',   "medium"),
+        (r'md5\s*\(',    "low"),    # MD5 is weak but common — low, not medium
+        (r'sha1\s*\(',   "info"),   # SHA1 used everywhere in legacy code
+        # btoa/atob are used constantly for normal encoding, not just secrets
+        # Only flag if they appear to encode something sensitive
+        (r'btoa\s*\([^)]*(?:password|secret|token|key|auth)',  "medium"),
+        (r'atob\s*\([^)]*(?:password|secret|token|key|auth)',  "medium"),
     ],
 
     "URLs & Subdomains": [
-        (r'https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?', "info"),
-        (r'["\']([a-zA-Z0-9\-]+\.[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,})["\']',"info"),
+        # Only report external URLs that look interesting — not every CDN/library URL
+        # Internal/staging subdomains are more interesting than public CDN references
+        (r'https?://(?:staging|dev|test|internal|admin|api|backend|private)\.[a-zA-Z0-9\-\.]+', "info"),
+        (r'https?://(?:10|192\.168|172\.(?:1[6-9]|2[0-9]|3[01]))\.', "medium"),  # internal IPs in URLs
     ],
 
     "Version Control & Debug": [
