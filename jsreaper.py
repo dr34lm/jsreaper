@@ -182,22 +182,31 @@ def box_line(text, color=FG_DIM):
     return f"{color}{text}{RESET}"
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  BANNER  v2.0
+#  BANNER  v2.1
+#  Thin elegant line-art — uses / \ _ | chars like the classic figlet style.
+#  Gradient: lemon → lime → mint top to bottom.
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_banner():
-    return f"""
-{LEMON} ░░░░░░░░░ ░░░░░░░░░░░░░░░ ░░░░░░░░░  ░░░░░  ░░░░░░░░  ░░░░░░░░░ ░░░░░░░░░
-{LEMON} ░░       ░░       ░░    ░░ ░░       ░░   ░░ ░░       ░░        ░░       ░░
-{LIME} ░░░░░░░  ░░░░░░░░ ░░░░░░╝  ░░░░░░   ░░░░░░░ ░░░░░░░  ░░░░░░░░  ░░░░░░░░╝
-{LIME}      ░░  ╚════░░  ░░   ░░  ░░       ░░   ░░ ░░       ░░        ░░   ░░
-{MINT} ░░░░░░░  ░░░░░░░░ ░░    ░░ ░░░░░░░░ ░░   ░░ ░░       ░░░░░░░░░ ░░    ░░
-{MINT}  ╚═════╝  ╚══════╝ ╚═╝   ╚═╝╚══════╝  ╚═╝  ╚═╝╚═╝      ╚══════╝  ╚═╝   ╚═╝
-{GOLD}
-{GOLD}          ⚡  JavaScript Recon & Analysis Tool  v{TOOL_VERSION}
-{GRAY}          🌐  Linux | macOS | Windows  —  Python 3.7+
-{GRAY}          ✍   Written by @dr34lm  |  Research & Educational Use Only
-{RESET}"""
+    v = TOOL_VERSION
+    lines = [
+        LEMON + r"       ___  ________      ________  _______   ________  ________  _______   ________     ",
+        LEMON + r"      /\  \/\   ____\    /\   __  \/\  ___ \ /\   __  \/\   __  \/\  ___ \ /\   __  \    ",
+        LIME  + r"      \ \  \ \  \___|    \ \  \|\  \ \   __/|\ \  \|\  \ \  \|\  \ \   __/|\ \  \|\  \   ",
+        LIME  + r"    __ \ \  \ \_____  __ \ \   _  _\ \  \_|/_\ \   __  \ \   ____\ \  \_|/_\ \   _  _\  ",
+        MINT  + r"   /\ \_\  \  \|____|\  \/\ \  \\  \\ \  \_|\ \ \  \ \  \ \  \___|\ \  \_|\ \ \  \\  \| ",
+        MINT  + r"   \ \________\____\_\  \ \ \__\\ _\\ \_______\ \__\ \__\ \__\    \ \_______\ \__\\ _\ ",
+        MINT  + r"    \|________|\_________\ \|__|\|__|\|_______|\|__|\|__|\|__|     \|_______|\|__|\|__|",
+        LEMON + r"               \|_________|                                                              ",
+    ]
+    out = "\n"
+    for l in lines:
+        out += l + RESET + "\n"
+    out += f"\n{GOLD}          ⚡  JavaScript Recon & Analysis Tool  v{v}\n"
+    out += f"{GRAY}          ◈   Linux | macOS | Windows  —  Python 3.7+\n"
+    out += f"{GRAY}          ✦   Written by @dr34lm  |  Research & Educational Use Only\n"
+    out += RESET
+    return out
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  VERSION CHECKER
