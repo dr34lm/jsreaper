@@ -1043,6 +1043,30 @@ def assess_finding_confidence(match_text, context_line, category, severity, sour
 
     score = 50  # start neutral
 
+    # ── EARLY DEFINITIVE FILTERS — checked before anything else ─────────
+
+    # filter: syntax tokens from code editors (ACE, CodeMirror, etc.)
+    # token:"entity.other.attribute-name.xml" is a grammar definition, not a credential
+    if is_syntax_token(match_text, context_line):
+        result["confidence"] = "filtered"
+        result["fp_reason"]  = "Syntax grammar token — code editor definition, not a credential"
+        return result
+
+    # filter: hex/unicode data tables (character code tables used in editors/fonts)
+    # "0028005B007B0F3A..." is sequential unicode codepoints, not a token
+    hex_val = re.search(r'["\'\']([0-9A-Fa-f]{20,})["\'\']', match_text)
+    if hex_val and looks_like_data_table(hex_val.group(1)):
+        result["confidence"] = "filtered"
+        result["fp_reason"]  = "Sequential hex values — unicode character table, not a token"
+        return result
+
+    # filter: webpack module definitions — the context line starting with
+    # webpackJsonp means everything on that line is minified bundle boilerplate
+    if 'webpackJsonp' in context_line and 'AKIA' not in match_text and 'sk_live_' not in match_text:
+        if category not in ('AWS Credentials', 'Cloud & Infrastructure'):
+            score -= 35
+            result["fp_reason"] = "Found inside webpack bundle boilerplate — likely not application code"
+
     # ── extract the actual value from the match ──────────────────────────
     # try to pull out just the value part (after = or :)
     value_match = re.search(r'[=:]\s*["\']?([^"\';\s,\]{)]{4,})["\']?', match_text)
@@ -1154,63 +1178,226 @@ def assess_finding_confidence(match_text, context_line, category, severity, sour
 
 # broader catch-all patterns for the second pass
 # these are intentionally looser than the main patterns
+# ─── Known third-party library filenames ────────────────────────────────────
+# If a JS file matches any of these, we skip broad-pass analysis entirely.
+# These are vendor libraries — developers didn't write them and can't fix them.
+# Reporting findings from these files is pure noise.
+KNOWN_LIBRARY_FILENAMES = {
+    "ace", "ace-editor", "ace-min", "ace.min",
+    "lodash", "lodash.min", "underscore", "underscore.min",
+    "jquery", "jquery.min", "jquery-ui", "jquery-ui.min",
+    "bootstrap", "bootstrap.min", "bootstrap.bundle",
+    "moment", "moment.min", "moment-timezone",
+    "react", "react.min", "react-dom", "react.development",
+    "vue", "vue.min", "vue.runtime",
+    "angular", "angular.min",
+    "d3", "d3.min", "d3.v5", "d3.v6", "d3.v7",
+    "three", "three.min",
+    "chart", "chart.min", "chartjs",
+    "leaflet", "leaflet.min",
+    "highlight", "highlight.min", "hljs",
+    "prism", "prism.min",
+    "codemirror",
+    "tinymce", "tinymce.min",
+    "ckeditor",
+    "socket.io", "socket.io.min",
+    "axios", "axios.min",
+    "popper", "popper.min",
+    "font-awesome",
+    "materialize",
+    "bulma",
+    "sweetalert", "sweetalert2",
+    "select2",
+    "datatables",
+    "fullcalendar",
+    "gsap",
+    "swiper",
+    "slick",
+    "aos",
+    "modernizr",
+    "normalize",
+    "polyfill",
+    "core-js",
+    "regenerator",
+    "babel",
+    "webpack",
+    "node_modules",
+    "node_vendors",
+    "vendors",
+    "vendor",
+    "chunk",          # webpack chunk files often contain third-party code
+}
+
+# Known library content signatures — if file CONTENT matches these,
+# it's a third-party library regardless of filename
+KNOWN_LIBRARY_CONTENT_SIGS = [
+    r'webpackJsonp.*node_vendors',
+    r'node_vendors~',                       # webpack vendor chunk naming pattern          # webpack vendor bundle
+    r'This file is part of (jQuery|React|Angular|Vue)',
+    r'@license.*MIT.*jquery',
+    r'Ace \(Ajax.org Cloud9 Editor\)',       # ACE editor
+    r'CodeMirror, copyright',
+    r'Leaflet - a JS library for',
+    r'D3\.js - Data-Driven Documents',
+    r'Lodash.*MIT License',
+    r'moment\.js.*copyright',
+    r'Copyright.*Bootstrap',
+    r'THREE\.REVISION',                     # three.js
+    r'Chart\.js.*Copyright',
+    r'!function\(e\)\{if\("object"==typeof exports&&"undefined"!=typeof module\)',  # UMD bundle pattern
+]
+
+def is_library_file(url, content_sample):
+    """
+    Determine if a JS file is a third-party library.
+    Checks both the filename and the first 500 chars of content.
+    Returns (bool, reason).
+    """
+    # check filename against known library names
+    filename = url.split('/')[-1].lower()
+    # strip version numbers and hashes from filename
+    # e.g. "jquery-3.6.0.min.js" -> "jquery"
+    # strip version numbers, hashes, chunk suffixes from filename
+    # handles: jquery-3.6.0.min.js, admin-3bfe1920e4fc94cca843.chunk.js, etc.
+    clean_name = re.sub(r'[-_~.](?:v?\d[\d\.]*|min|bundle|esm|cjs|umd)', '', filename)
+    clean_name = re.sub(r'[-_~][a-f0-9]{6,}', '', clean_name)  # remove hex hashes
+    clean_name = re.sub(r'\d{6,}', '', clean_name)              # remove long digit sequences
+    clean_name = clean_name.replace('.js', '').replace('.chunk', '').strip('-_~.')
+
+    for lib in KNOWN_LIBRARY_FILENAMES:
+        if lib in clean_name or clean_name in lib:
+            return True, f"Filename matches known library: {lib}"
+
+    # check URL path components
+    url_lower = url.lower()
+    for lib in ['node_vendors', 'node_modules', '/vendor/', '/vendors/', '/lib/', '/libs/', 'node_vendors~']:
+        if lib in url_lower:
+            return True, f"URL path indicates vendor bundle: {lib}"
+
+    # check content signatures (first 1000 chars)
+    for sig in KNOWN_LIBRARY_CONTENT_SIGS:
+        if re.search(sig, content_sample[:1000], re.IGNORECASE):
+            return True, f"Content matches library signature"
+
+    return False, ""
+
+
+# ─── Hex/unicode pattern filters ─────────────────────────────────────────────
+# These patterns help us distinguish real tokens from data tables
+
+def looks_like_data_table(hex_string):
+    """
+    Unicode/hex character tables look like tokens but aren't.
+    Real tokens: random alphanumeric, uniform distribution
+    Data tables: sequential unicode codepoints like 0028 0029 002A...
+    """
+    if not hex_string:
+        return False
+
+    # check for sequential unicode codepoints (e.g. 0028005B007B...)
+    # real tokens don't have this pattern
+    chunks = [hex_string[i:i+4] for i in range(0, min(len(hex_string), 40), 4)]
+    if len(chunks) >= 4:
+        try:
+            vals = [int(c, 16) for c in chunks if len(c) == 4]
+            if len(vals) >= 4:
+                # if values increase sequentially (like unicode tables), it's data
+                diffs = [vals[i+1] - vals[i] for i in range(len(vals)-1)]
+                if all(0 < d < 200 for d in diffs[:4]):
+                    return True
+        except ValueError:
+            pass
+
+    # check for repeating 2-char patterns typical of unicode escapes
+    if re.match(r'^([0-9A-F]{4}){3,}$', hex_string.upper()):
+        return True
+
+    return False
+
+
+def is_syntax_token(match_text, context_line):
+    """
+    ACE editor, CodeMirror, and similar tools define syntax tokens like:
+    token:"keyword.operator.xml" or token:"entity.other.attribute-name.xml"
+    These look like our token: patterns but are just grammar definitions.
+    """
+    # syntax token patterns from code editors
+    if re.search(r'token\s*[=:]\s*["\'][\w.]+(?:\.\w+){2,}["\']', match_text):
+        return True
+    # dot-notation strings (grammar definitions never used as real tokens)
+    value_match = re.search(r'[=:]\s*["\']([^"\']+)["\']', match_text)
+    if value_match:
+        val = value_match.group(1)
+        # grammar definition: contains 3+ dot-separated lowercase words
+        parts = val.split('.')
+        if len(parts) >= 3 and all(p.islower() and p.isalpha() for p in parts[:3]):
+            return True
+    return False
+
+
+# ─── Tighter broad-pass patterns ──────────────────────────────────────────────
+# Every pattern here requires REAL credential context, not just any long string.
+# Removed: generic hex strings, generic token: matches, generic long strings.
+# Kept: patterns with near-zero false positive rate.
+
 FN_BROAD_PATTERNS = [
-    # any long (32+) alphanumeric string assigned to a key/token/secret variable
-    (r'(?:key|token|secret|password|auth|cred)[s_\-]?\s*[=:]\s*["\']([A-Za-z0-9_\-\.+/]{32,})["\']', "high",
-     "Long string assigned to sensitive variable name"),
+    # key/token/secret/password VARIABLE assigned a RANDOM-LOOKING string (32+ chars)
+    # The value must contain mixed case AND digits — rules out grammar strings
+    (r'(?:api_?key|api_?token|secret_?key|access_?token|auth_?token|private_?key|client_?secret)'
+     r'\s*[=:]\s*["\']([A-Za-z0-9_\-\.+/]{32,})["\']',
+     "high", "Specific credential variable assigned long random-looking value"),
 
-    # anything that looks like base64 (long, ends with =)
-    (r'["\']([A-Za-z0-9+/]{40,}={1,2})["\']', "medium",
-     "Long base64-encoded string — may contain encoded credentials"),
+    # Authorization header with actual token value inline
+    (r'["\']Authorization["\']?\s*[,:]\s*["\']?(Bearer|Basic|Token)\s+([A-Za-z0-9_\-\.+/=]{20,})',
+     "high", "Authorization header with hardcoded token value"),
 
-    # hex strings 32+ chars (MD5/SHA hashes or tokens)
-    (r'["\']([0-9a-f]{32,})["\']', "low",
-     "Long hex string — may be a token or hash"),
+    # URL with credentials embedded (user:pass@host) — always real
+    (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%^&*]{6,}@[A-Za-z0-9\-\.]+',
+     "critical", "URL with embedded credentials (user:pass@host format)"),
 
-    # anything after 'Authorization:' header construction
-    (r'["\']Authorization["\']?\s*[,:]?\s*["\']?(Bearer|Basic|Token)\s+([A-Za-z0-9_\-\.+/=]{16,})', "high",
-     "Authorization header with inline token"),
+    # PEM private key block — always real, zero false positives
+    (r'-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----',
+     "critical", "PEM private key block found in JS"),
 
-    # URL with credentials embedded
-    (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%^&*]{4,}@', "critical",
-     "URL with embedded credentials (user:pass@host)"),
+    # JWT: must start with eyJ (base64 JSON header) — format is very specific
+    (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}',
+     "high", "JWT token — three-part base64 structure starting with eyJ"),
 
-    # private key in variable
-    (r'(?:private|priv)[_\-]?key\s*=\s*["\']([^"\']{20,})["\']', "critical",
-     "Private key assigned to variable"),
+    # Google Cloud service account JSON
+    (r'"type"\s*:\s*"service_account"',
+     "critical", "Google Cloud service account JSON key"),
 
-    # JWT token pattern (three base64 parts separated by dots)
-    (r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', "high",
-     "JWT token detected (three-part base64 structure)"),
+    # Slack webhook — very specific URL format, near-zero FP
+    (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}',
+     "high", "Slack webhook URL with real token structure"),
 
-    # GCP service account key pattern
-    (r'"type"\s*:\s*"service_account"', "critical",
-     "Google Cloud service account JSON key"),
+    # GitHub tokens — very specific prefix format
+    (r'gh[pousr]_[A-Za-z0-9]{36,}',
+     "critical", "GitHub personal access token (ghp_/gho_/ghu_/ghs_/ghr_ prefix)"),
 
-    # Slack webhook URL
-    (r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[A-Za-z0-9]+', "high",
-     "Slack webhook URL — can post messages to Slack channels"),
+    # NPM token — very specific format
+    (r'npm_[A-Za-z0-9]{36,}',
+     "high", "NPM access token"),
 
-    # GitHub personal access token
-    (r'gh[pousr]_[A-Za-z0-9]{36,}', "critical",
-     "GitHub personal access token"),
-
-    # npm token
-    (r'npm_[A-Za-z0-9]{36,}', "high",
-     "NPM access token"),
+    # Hardcoded Basic auth header value
+    (r'Basic\s+[A-Za-z0-9+/]{20,}={0,2}(?=["\'\s,;])',
+     "high", "Hardcoded Basic auth value (base64 encoded credentials)"),
 ]
 
 
-def run_false_negative_pass(content, lines, already_found_hashes, source_domain=""):
+def run_false_negative_pass(content, lines, already_found_hashes,
+                             source_domain="", source_url=""):
     """
-    Second analysis pass with broader patterns to catch things the main
-    patterns might have missed.
-
-    Skips anything already found in the main pass (by hash).
-    Runs each match through the confidence scorer — only returns
-    findings with confidence >= 'possible'.
+    Second analysis pass — tighter patterns for real missed credentials.
+    Skips library files. Filters syntax tokens and hex data tables.
+    Only returns confirmed or likely findings.
     """
     fn_findings = []
+
+    # skip vendor/library files entirely — they always look suspicious
+    is_lib, lib_reason = is_library_file(source_url, content[:2000])
+    if is_lib:
+        return []
 
     for pattern, severity, description in FN_BROAD_PATTERNS:
         try:
@@ -1309,6 +1496,182 @@ def extract_js_from_page(url, session, waf_aware=False):
 #  JS CONTENT ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PARAMETER EXTRACTION ENGINE
+#
+#  Real bug bounty value: find all URL parameters, form fields, API params,
+#  and function arguments that the app sends or accepts.
+#  These are the inputs you test for injection, IDOR, XSS, etc.
+#
+#  This is different from just listing URLs — we extract:
+#    - Query parameters: ?id=, ?user=, ?token=
+#    - API endpoint + parameter combinations
+#    - Form field names
+#    - Function parameter names in fetch/axios calls
+#    - GraphQL query variables
+# ═════════════════════════════════════════════════════════════════════════════
+
+def extract_parameters_and_endpoints(content, source_url=""):
+    """
+    Extract URL parameters, API endpoints, form fields, and function call
+    patterns from JS file content.
+
+    Returns dict with:
+      all       — every endpoint+param combo found
+      sensitive — those with security-relevant parameter names (id, token, etc.)
+      count     — total count
+    """
+    findings = []
+    seen     = set()
+
+    def add(endpoint, params, method="GET", ptype="url_param", context=""):
+        key = hashlib.md5(f"{endpoint}{str(sorted(params))}".encode()).hexdigest()
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append({
+            "endpoint": endpoint,
+            "params":   list(params),
+            "method":   method,
+            "type":     ptype,
+            "context":  context[:100],
+        })
+
+    # 1. fetch() with string URL
+    for m in re.finditer(
+        r'fetch\s*\(\s*(["\'][^"\']{3,80}["\'])',
+        content, re.IGNORECASE
+    ):
+        raw = m.group(1).strip('"\'')
+        if raw.startswith('/') or raw.startswith('http'):
+            nearby  = content[m.start():min(m.start()+400, len(content))]
+            body_m  = re.search(r'body\s*:\s*JSON\.stringify\s*\(\s*\{([^}]{0,200})\}', nearby, re.IGNORECASE)
+            params  = set(re.findall(r'(\w+)\s*:', body_m.group(1))) if body_m else set()
+            method  = "POST" if body_m else "GET"
+            add(raw, params, method, "fetch", m.group(0)[:80])
+
+    # 2. fetch() with template literal
+    for m in re.finditer(r'fetch\s*\(\s*`([^`]{3,100})`', content, re.IGNORECASE):
+        tpl    = m.group(1)
+        params = set(re.findall(r'\$\{(\w+)\}', tpl))
+        ep     = re.sub(r'\$\{[^}]+\}', '*', tpl)
+        if ep.startswith('/') or ep.startswith('http'):
+            add(ep, params, "GET", "fetch_template", tpl[:80])
+
+    # 3. axios calls
+    for m in re.finditer(
+        r'axios\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']{3,80})["\']',
+        content, re.IGNORECASE
+    ):
+        method   = m.group(1).upper()
+        endpoint = m.group(2)
+        nearby   = content[m.start():min(m.start()+300, len(content))]
+        body_m   = re.search(r'\{([^}]{0,200})\}', nearby)
+        params   = set(re.findall(r'(\w+)\s*:', body_m.group(1))) if body_m else set()
+        add(endpoint, params, method, "axios", m.group(0)[:80])
+
+    # 4. XMLHttpRequest
+    for m in re.finditer(
+        r'\.open\s*\(\s*["\']([A-Z]+)["\'],\s*["\']([^"\']{3,80})["\']',
+        content, re.IGNORECASE
+    ):
+        method   = m.group(1).upper()
+        endpoint = m.group(2)
+        add(endpoint, set(), method, "xhr", m.group(0)[:80])
+
+    # 5. URL with query string parameters
+    for m in re.finditer(
+        r'["\']([/?][^\s"\'<>]{2,80}\?[^\s"\'<>]{2,100})["\']',
+        content, re.IGNORECASE
+    ):
+        full = m.group(1)
+        if '?' in full:
+            path, qs = full.split('?', 1)
+            params   = set(re.findall(r'(\w+)=', qs))
+            if params:
+                add(path, params, "GET", "url_param", full[:80])
+
+    # 6. URLSearchParams / FormData append calls
+    for m in re.finditer(
+        r'(?:searchParams|formData|params|data)\.(?:append|set)\s*\(\s*["\'](\w+)["\']',
+        content, re.IGNORECASE
+    ):
+        param_name = m.group(1)
+        nearby     = content[max(0, m.start()-200):m.start()]
+        url_m      = re.search(r'["\']([/?][^"\']{2,60})["\']', nearby)
+        endpoint   = url_m.group(1) if url_m else "(unknown)"
+        add(endpoint, {param_name}, "POST", "form_data", m.group(0)[:60])
+
+    # 7. GraphQL operations
+    for m in re.finditer(
+        r'(?:query|mutation)\s+(\w+)\s*(?:\(([^)]{0,200})\))?\s*\{',
+        content, re.IGNORECASE
+    ):
+        op_name = m.group(1)
+        args    = m.group(2) or ""
+        params  = set(re.findall(r'\$(\w+)', args))
+        add(f"graphql:{op_name}", params, "POST", "graphql", m.group(0)[:80])
+
+    # 8. Route definitions (React Router, Vue Router, etc.)
+    for m in re.finditer(
+        r'(?:path|route)\s*:\s*["\']([^"\']{2,80})["\']',
+        content, re.IGNORECASE
+    ):
+        path   = m.group(1)
+        params = set(re.findall(r':(\w+)', path))
+        if path.startswith('/'):
+            add(path, params, "GET", "route", m.group(0)[:60])
+
+    # 9. REST API client patterns (e.g. this.http.get('/api/users/' + id))
+    for m in re.finditer(
+        r'(?:this\.|self\.)?(?:http|client|api|service)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']{3,80})["\']',
+        content, re.IGNORECASE
+    ):
+        method   = m.group(1).upper()
+        endpoint = m.group(2)
+        add(endpoint, set(), method, "http_client", m.group(0)[:80])
+
+    # ── Flag security-sensitive parameter names ────────────────────────────
+    SENSITIVE_PARAMS = {
+        # IDOR candidates — direct object references
+        'id', 'user_id', 'userid', 'uid', 'account_id', 'object_id',
+        'record_id', 'doc_id', 'item_id', 'order_id', 'invoice_id',
+        'customer_id', 'profile_id', 'report_id', 'message_id',
+        # auth params — may bypass auth or access tokens
+        'token', 'access_token', 'auth', 'api_key', 'apikey', 'key',
+        'session', 'session_id', 'sessionid', 'cookie', 'jwt',
+        'auth_token', 'authorization',
+        # open redirect candidates
+        'redirect', 'redirect_uri', 'return_url', 'next', 'url',
+        'callback', 'return', 'destination', 'forward', 'goto',
+        # path traversal candidates
+        'file', 'path', 'filename', 'filepath', 'dir', 'folder',
+        'document', 'template', 'include', 'page', 'load',
+        # injection candidates
+        'cmd', 'command', 'exec', 'run', 'query', 'sql', 'search',
+        'filter', 'where', 'sort', 'order', 'group', 'limit',
+        # privilege escalation candidates
+        'role', 'permission', 'priv', 'privilege', 'admin', 'level',
+        'type', 'scope', 'access', 'right',
+        # enumeration candidates
+        'email', 'username', 'user', 'name', 'phone', 'mobile',
+        'ssn', 'dob', 'address', 'zip', 'postcode',
+    }
+
+    sensitive_found = []
+    for f in findings:
+        hit = SENSITIVE_PARAMS & {p.lower() for p in f["params"]}
+        if hit:
+            sensitive_found.append({**f, "sensitive_params": sorted(list(hit))})
+
+    return {
+        "all":       findings,
+        "sensitive": sensitive_found,
+        "count":     len(findings),
+    }
+
+
 def analyze_js_content(url, content, beautify=False, source_domain=""):
     """
     Full analysis of one JS file.
@@ -1321,10 +1684,13 @@ def analyze_js_content(url, content, beautify=False, source_domain=""):
         "size":          len(content),
         "findings":      [],
         "endpoints":     [],
+        "parameters":    {},   # parameter extraction results
         "js_relations":  [],
         "technologies":  {},
         "tech_risks":    [],
         "score":         0,
+        "library_file":  False,
+        "library_reason":"",
     }
 
     if beautify and JS_BEAUTIFIER:
@@ -1335,6 +1701,53 @@ def analyze_js_content(url, content, beautify=False, source_domain=""):
 
     lines         = content.split("\n")
     seen_findings = set()
+
+    # ── library file detection ──────────────────────────────────────────────
+    # if this is a third-party vendor file, massively restrict what we report.
+    # only report CRITICAL findings (real keys, PEM blocks) from library files.
+    # skip all OWASP, endpoint, and infrastructure patterns.
+    is_lib, lib_reason = is_library_file(url, content[:2000])
+    if is_lib:
+        results["library_file"] = True
+        results["library_reason"] = lib_reason
+        # only run high-value patterns on library files
+        LIBRARY_SAFE_CATEGORIES = {"AWS Credentials", "Authentication & Passwords",
+                                   "Cloud & Infrastructure", "Database Credentials"}
+        for category, patterns in SENSITIVE_PATTERNS.items():
+            if category not in LIBRARY_SAFE_CATEGORIES:
+                continue
+            for pattern, severity in patterns:
+                if severity not in ("critical",):   # only critical from library files
+                    continue
+                try:
+                    for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                        matched_str = match.group(0)[:120]
+                        line_num    = content[:match.start()].count("\n") + 1
+                        line_ctx    = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+                        dedup_key   = hashlib.md5(f"{category}{matched_str}".encode()).hexdigest()
+                        if dedup_key in seen_findings:
+                            continue
+                        seen_findings.add(dedup_key)
+                        conf = assess_finding_confidence(matched_str, line_ctx, category,
+                                                         severity, results["source_domain"])
+                        if conf["confidence"] == "filtered":
+                            continue
+                        results["findings"].append({
+                            "category": category, "severity": conf["adjusted_severity"],
+                            "original_severity": severity, "match": matched_str,
+                            "line": line_num, "context": line_ctx,
+                            "source_domain": results["source_domain"], "source_file": url,
+                            "confidence": conf["confidence"],
+                            "confidence_score": conf["confidence_score"],
+                            "fp_reason": conf["fp_reason"],
+                            "library_file": True,
+                        })
+                        results["score"] += 100  # only critical findings from libs
+                except re.error:
+                    continue
+        # skip the rest of analysis for library files
+        results["endpoints"] = extract_parameters_and_endpoints(content, url)
+        return results
 
     for category, patterns in SENSITIVE_PATTERNS.items():
         for pattern, severity in patterns:
@@ -1384,7 +1797,8 @@ def analyze_js_content(url, content, beautify=False, source_domain=""):
     # run broader patterns to catch things the main pass might have missed
     fn_findings = run_false_negative_pass(
         content, lines, seen_findings,
-        source_domain=results["source_domain"]
+        source_domain=results["source_domain"],
+        source_url=url
     )
     results["findings"].extend(fn_findings)
     score_map = {"critical":100,"high":50,"medium":20,"low":5,"info":1}
@@ -1410,6 +1824,10 @@ def analyze_js_content(url, content, beautify=False, source_domain=""):
             rel = match.group(1)
             if rel not in results["js_relations"]:
                 results["js_relations"].append(rel)
+
+
+    # ── parameter extraction ────────────────────────────────────────────
+    results["parameters"] = extract_parameters_and_endpoints(content, url)
 
     # tech fingerprint
     results["technologies"] = fingerprint_technologies(content, url)
@@ -1556,6 +1974,10 @@ def print_analysis(results, show_endpoints=True):
           f"{FG_DIM}Score:{RESET} {score_color}{score}{RESET}")
     print(f"{FG_DIM}{'─'*w}{RESET}")
 
+    # library file notice — tell users why findings may be limited
+    if results.get("library_file"):
+        print(f"  {FG_DIM}⊘ Library file — only critical findings shown ({results.get('library_reason','')}){RESET}")
+
     # tech stack
     if results.get("technologies"):
         techs = list(results["technologies"].keys())
@@ -1621,6 +2043,33 @@ def print_analysis(results, show_endpoints=True):
         print(f"\n  {FG_RELATION}▸ JS Imports ({len(results['js_relations'])}){RESET}")
         for rel in results["js_relations"][:10]:
             print(f"    {FG_RELATION}  ↳ {rel[:w-10]}{RESET}")
+
+    # ── parameter findings ────────────────────────────────────────────────
+    params_data = results.get("parameters", {})
+    sensitive   = params_data.get("sensitive", [])
+    all_params  = params_data.get("all", [])
+
+    if sensitive:
+        print(f"\n  {FG_CRITICAL}▸ SENSITIVE PARAMETERS FOUND ({len(sensitive)}) — test these for injection/IDOR{RESET}")
+        for p in sensitive[:15]:
+            method   = p.get("method","GET")
+            endpoint = p.get("endpoint","?")[:50]
+            sparams  = ", ".join(p.get("sensitive_params",[]))
+            ptype    = p.get("type","")
+            print(f"    {SEVERITY_BADGE['high']} {method} {RESET}  {FG_URL}{endpoint}{RESET}")
+            print(f"    {FG_CRITICAL}         ⚠ Sensitive params: {sparams}{RESET}  {FG_DIM}[{ptype}]{RESET}")
+
+    elif all_params and len(all_params) > 0:
+        print(f"\n  {FG_SECTION}▸ Parameters & Endpoints ({len(all_params)}){RESET}")
+        for p in all_params[:10]:
+            method   = p.get("method","GET")
+            endpoint = p.get("endpoint","?")[:60]
+            params   = ", ".join(p.get("params",[])[:5])
+            ptype    = p.get("type","")
+            param_str = f"  [{params}]" if params else ""
+            print(f"    {FG_DIM}{method}{RESET}  {FG_URL}{endpoint}{RESET}{FG_DIM}{param_str}  [{ptype}]{RESET}")
+        if len(all_params) > 10:
+            print(f"    {FG_DIM}... and {len(all_params)-10} more in output file{RESET}")
 
 def print_correlations(correlations):
     """print cross-file correlation findings"""
