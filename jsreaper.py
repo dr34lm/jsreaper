@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║                         JSReaper v2.0                               ║
+# ║                         JSReaper v2.1                               ║
 # ║         JavaScript Recon & Analysis Tool for Bug Bounty             ║
 # ║                                                                      ║
 # ║  Written by @dr34lm                                                  ║
@@ -19,6 +19,8 @@
 #   v2.0 - Burp Suite JS input parsing, version checker, status probe,
 #           dynamic terminal layout, cross-file correlation engine,
 #           tech fingerprinting + CVE lookup, cleaner findings per domain
+#   v2.1 - self-updater (--update), false positive reduction engine,
+#           false negative reduction engine, confidence scoring per finding
 
 import argparse
 import sys
@@ -36,7 +38,7 @@ from urllib.parse import urljoin, urlparse
 from collections import defaultdict
 import threading
 
-TOOL_VERSION = "2.0"
+TOOL_VERSION = "2.1"
 TOOL_NAME    = "JSReaper"
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -201,7 +203,8 @@ def get_banner():
 #  VERSION CHECKER
 # ═════════════════════════════════════════════════════════════════════════════
 
-LATEST_VERSION_URL = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
+LATEST_VERSION_URL  = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
+LATEST_SCRIPT_URL   = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/jsreaper.py"
 
 def check_version():
     """
@@ -224,12 +227,123 @@ def check_version():
                 print(f"    {FG_DIM}Status :{RESET} {FG_SUCCESS}✓ Up to date (v{TOOL_VERSION} is latest){RESET}")
             else:
                 print(f"    {FG_DIM}Status :{RESET} {FG_MEDIUM}⚠ Update available: v{latest}  (you have v{TOOL_VERSION}){RESET}")
-                print(f"    {FG_DIM}Update :{RESET} {FG_URL}git -C $(which jsreaper | xargs dirname) pull{RESET}")
+                print(f"    {FG_DIM}Update :{RESET} {FG_URL}Run:  jsreaper --update{RESET}")
         else:
             print(f"    {FG_DIM}Status :{RESET} {FG_DIM}Could not check — running v{TOOL_VERSION}{RESET}")
     except Exception:
         print(f"    {FG_DIM}Status :{RESET} {FG_DIM}Offline — running v{TOOL_VERSION}{RESET}")
     print()
+
+
+def self_update():
+    """
+    --update flag: pull the latest jsreaper.py from GitHub and replace
+    the currently running script with it.
+
+    Steps:
+      1. Check the VERSION file on GitHub
+      2. If newer: download the new jsreaper.py
+      3. Back up the current script as jsreaper.py.bak
+      4. Replace the running script
+      5. Fix permissions and confirm
+
+    Works on Linux, macOS, and Windows.
+    Cross-platform: uses the path of the currently running script
+    so it works whether installed in /usr/local/bin, ~/bin, or anywhere.
+    """
+    section_header("SELF-UPDATE", FG_SECTION)
+    info(f"Current version : v{TOOL_VERSION}")
+    info("Checking GitHub for latest version...")
+
+    try:
+        # step 1 — check latest version number
+        ver_resp = requests.get(LATEST_VERSION_URL, timeout=10)
+        if ver_resp.status_code != 200:
+            error("Could not reach GitHub to check version. Are you online?")
+            sys.exit(1)
+
+        latest = ver_resp.text.strip()
+        info(f"Latest version  : v{latest}")
+
+        if latest == TOOL_VERSION:
+            print(f"\n{FG_SUCCESS}  ✓ You are already running the latest version (v{TOOL_VERSION}).{RESET}")
+            print(f"  {FG_DIM}No update needed.{RESET}\n")
+            return
+
+        # step 2 — newer version available, ask for confirmation
+        print(f"\n  {FG_MEDIUM}⚡ Update available: v{TOOL_VERSION} → v{latest}{RESET}")
+        print(f"  {FG_DIM}Source: {LATEST_SCRIPT_URL}{RESET}")
+
+        try:
+            answer = input(f"\n{FG_SECTION}  Proceed with update? [y/N]: {RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            warn("Update cancelled.")
+            return
+
+        if answer not in ["y", "yes"]:
+            warn("Update cancelled by user.")
+            return
+
+        # step 3 — download the new script
+        info("Downloading latest jsreaper.py from GitHub...")
+        script_resp = requests.get(LATEST_SCRIPT_URL, timeout=30)
+        if script_resp.status_code != 200:
+            error(f"Download failed — HTTP {script_resp.status_code}")
+            sys.exit(1)
+
+        new_content = script_resp.text
+        if len(new_content) < 1000:
+            # sanity check — real script is always > 1000 chars
+            error("Downloaded file looks too small — aborting for safety.")
+            sys.exit(1)
+
+        if "def main():" not in new_content:
+            # make sure we got an actual Python script, not an error page
+            error("Downloaded content doesn't look like a valid script — aborting.")
+            sys.exit(1)
+
+        # step 4 — find where THIS script is currently installed
+        script_path = os.path.realpath(sys.argv[0])
+        backup_path = script_path + ".bak"
+
+        info(f"Script location : {script_path}")
+
+        # step 5 — back up current version
+        try:
+            import shutil as _shutil
+            _shutil.copy2(script_path, backup_path)
+            success(f"Backup saved    : {backup_path}")
+        except Exception as e:
+            warn(f"Could not create backup: {e} — continuing anyway")
+
+        # step 6 — write the new version
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+        except PermissionError:
+            # on Linux/Mac if installed with sudo, we need elevated write
+            error(f"Permission denied writing to {script_path}")
+            error("Try:  sudo jsreaper --update")
+            sys.exit(1)
+
+        # step 7 — fix permissions (important on Linux/Mac)
+        try:
+            os.chmod(script_path, 0o755)
+        except Exception:
+            pass  # windows doesn't need this
+
+        print(f"\n{FG_SUCCESS}  ✓ JSReaper updated successfully!{RESET}")
+        print(f"  {FG_SUCCESS}  v{TOOL_VERSION} → v{latest}{RESET}")
+        print(f"  {FG_DIM}  Backup of old version: {backup_path}{RESET}")
+        print(f"  {FG_DIM}  Run  jsreaper --version  to confirm.{RESET}\n")
+
+    except requests.exceptions.ConnectionError:
+        error("No internet connection. Cannot check for updates.")
+        sys.exit(1)
+    except Exception as e:
+        error(f"Update failed: {e}")
+        sys.exit(1)
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  BURP SUITE JS INPUT PARSER
@@ -779,8 +893,338 @@ def check_tech_risks(detected_techs):
     return risks
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  JS DISCOVERY
+#  FALSE POSITIVE REDUCTION ENGINE
+#
+#  One of the biggest problems with pattern-matching security tools is noise.
+#  A raw regex that matches "password" will fire on:
+#    - password = "enter your password here"   ← placeholder, NOT a real secret
+#    - password = "changeme"                   ← example value, NOT a real secret
+#    - password = myVariable                   ← no value, NOT a finding
+#    - password = "x7kP#mQ2!vL9nR4"            ← THIS is a real finding
+#
+#  This engine scores each raw match and decides:
+#    CONFIRMED  — high confidence, show it prominently
+#    LIKELY     — probably real, show with a note
+#    POSSIBLE   — low confidence, show only in verbose mode
+#    FILTERED   — almost certainly a false positive, drop it silently
+#
+#  This way users see fewer irrelevant results and can trust what they see.
 # ═════════════════════════════════════════════════════════════════════════════
+
+# placeholder values that almost always indicate a false positive
+# developers use these as example/template values in their code
+FP_PLACEHOLDER_VALUES = {
+    # generic placeholders
+    "your_api_key_here", "insert_key_here", "api_key_here",
+    "your-api-key", "api-key-here", "enter_api_key",
+    "put_your_key_here", "replace_with_your_key",
+    # password placeholders
+    "password", "your_password", "enter_password",
+    "changeme", "change_me", "change-me",
+    "yourpassword", "mypassword", "testpassword",
+    "password123", "123456", "qwerty", "admin",
+    "pass", "passwd", "secret", "test", "example",
+    # token placeholders
+    "your_token_here", "token_here", "insert_token",
+    "your-token", "mytoken", "testtoken", "sample_token",
+    # null/undefined
+    "null", "undefined", "none", "false", "true",
+    "n/a", "na", "tbd", "todo", "fixme",
+    # empty / short
+    "", " ", "x", "xx", "xxx", "test123",
+    # documentation examples
+    "sk-xxxxxxxxxxxxxxxxxxxx", "akia_xxxxxxxxxxxxxxxxxxxx",
+    "your_secret_key", "your_access_key",
+    "1234567890abcdef", "abcdefghijklmnop",
+}
+
+# regex patterns that almost always indicate a false positive context
+FP_CONTEXT_PATTERNS = [
+    # comment lines — value is in a comment, not real code
+    r'^\s*[/*#]+.*(?:key|token|password|secret)',
+    # documentation strings
+    r'(?:example|sample|placeholder|dummy|fake|mock|test|demo)\s*[=:]',
+    # console.log — developer was just printing it
+    r'console\.\w+\s*\(',
+    # HTML/template variables like {{ API_KEY }} or <%= key %>
+    r'\{\{.*\}\}|\<%.*%\>',
+    # variable assigned to another variable (no literal value)
+    r'=\s*(?:process\.env\.|config\.|settings\.|env\.)',
+    # import/require statement — not a hardcoded value
+    r'(?:import|require)\s*[\(\{]',
+]
+
+# patterns that INCREASE confidence a finding is real
+FP_REAL_INDICATORS = [
+    # high-entropy strings — real keys look random
+    # base64-like long strings
+    r'[A-Za-z0-9+/]{40,}={0,2}',
+    # hex strings typical of real tokens
+    r'[0-9a-f]{32,}',
+    # AWS key format
+    r'AKIA[0-9A-Z]{16}',
+    # starts with known real prefixes
+    r'sk_live_', r'pk_live_', r'SG\.', r'ghp_', r'gho_', r'github_pat_',
+    # PEM block — always real
+    r'-----BEGIN',
+]
+
+# known test/example domains — findings in these files are likely fake
+FP_TEST_DOMAINS = {
+    "example.com", "test.com", "localhost", "127.0.0.1",
+    "placeholder.com", "yourdomain.com", "domain.com",
+    "sample.com", "demo.com", "fake.com",
+}
+
+
+def string_entropy(s):
+    """
+    Calculate Shannon entropy of a string.
+    Real secrets have high entropy (look random).
+    Placeholder values have low entropy (repetitive/dictionary words).
+    Returns a float: higher = more random = more likely real.
+    """
+    if not s or len(s) < 4:
+        return 0.0
+    import math
+    freq = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    length  = len(s)
+    entropy = -sum((count/length) * math.log2(count/length) for count in freq.values())
+    return round(entropy, 2)
+
+
+def assess_finding_confidence(match_text, context_line, category, severity, source_domain=""):
+    """
+    Score a finding for confidence — is it real or a false positive?
+
+    Returns a dict:
+      confidence: "confirmed" | "likely" | "possible" | "filtered"
+      confidence_score: 0-100
+      fp_reason: why we think it might be FP (if applicable)
+      fn_note: note about potential false negatives (if applicable)
+      adjusted_severity: may downgrade severity for low-confidence findings
+    """
+    result = {
+        "confidence":        "possible",
+        "confidence_score":  50,
+        "fp_reason":         "",
+        "fn_note":           "",
+        "adjusted_severity": severity,
+    }
+
+    score = 50  # start neutral
+
+    # ── extract the actual value from the match ──────────────────────────
+    # try to pull out just the value part (after = or :)
+    value_match = re.search(r'[=:]\s*["\']?([^"\';\s,\]{)]{4,})["\']?', match_text)
+    value       = value_match.group(1).strip() if value_match else match_text.strip()
+    value_lower = value.lower()
+
+    # ── false positive checks ────────────────────────────────────────────
+
+    # check 1: is the value a known placeholder?
+    if value_lower in FP_PLACEHOLDER_VALUES or len(value) < 6:
+        score -= 40
+        result["fp_reason"] = f"Value '{value[:30]}' looks like a placeholder or example"
+
+    # check 2: is the value suspiciously short or all the same char?
+    if len(value) < 8:
+        score -= 20
+        result["fp_reason"] = "Value is very short — likely not a real secret"
+
+    if len(set(value)) < 3:
+        score -= 30
+        result["fp_reason"] = "Value has very low character variety — likely placeholder"
+
+    # check 3: does the context line suggest it's a comment or template?
+    for ctx_pat in FP_CONTEXT_PATTERNS:
+        if re.search(ctx_pat, context_line, re.IGNORECASE):
+            score -= 25
+            result["fp_reason"] = "Found in comment, template, or environment variable reference"
+            break
+
+    # check 4: is it from a known test domain?
+    if source_domain.lower().replace("www.", "") in FP_TEST_DOMAINS:
+        score -= 20
+        result["fp_reason"] = "Source domain looks like a test/example domain"
+
+    # check 5: does it look like a variable name rather than a value?
+    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', value) and len(value) < 30:
+        score -= 20
+        result["fp_reason"] = "Match looks like a variable name, not a hardcoded value"
+
+    # check 6: process.env references are never hardcoded secrets
+    if "process.env." in match_text or "os.environ" in match_text:
+        score -= 50
+        result["fp_reason"] = "Value comes from environment variable — not hardcoded"
+
+    # ── real/confirmed indicators ─────────────────────────────────────────
+
+    # boost 1: high entropy = looks like a real secret
+    ent = string_entropy(value)
+    if ent >= 4.5:
+        score += 30
+    elif ent >= 3.5:
+        score += 15
+    elif ent < 2.0:
+        score -= 20
+
+    # boost 2: matches a known real-credential format
+    for real_pat in FP_REAL_INDICATORS:
+        if re.search(real_pat, match_text):
+            score += 35
+            break
+
+    # boost 3: category-specific boosts for highest-confidence patterns
+    if category == "AWS Credentials" and re.search(r'AKIA[0-9A-Z]{16}', match_text):
+        score = 95   # AWS access key ID format is unique — almost never FP
+        result["fp_reason"] = ""
+
+    if category == "Cloud & Infrastructure":
+        if re.search(r'sk_live_[A-Za-z0-9]{24,}', match_text):
+            score = 95  # Stripe live key format is unique
+        if re.search(r'SG\.[A-Za-z0-9_\-\.]{40,}', match_text):
+            score = 90  # SendGrid key format
+
+    if re.search(r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', match_text):
+        score = 99  # PEM block is never a false positive
+
+    # ── clamp score to 0-100 ─────────────────────────────────────────────
+    score = max(0, min(100, score))
+    result["confidence_score"] = score
+
+    # ── assign confidence label ───────────────────────────────────────────
+    if score >= 75:
+        result["confidence"]        = "confirmed"
+        result["adjusted_severity"] = severity  # keep original
+    elif score >= 50:
+        result["confidence"]        = "likely"
+        result["adjusted_severity"] = severity
+    elif score >= 25:
+        result["confidence"]        = "possible"
+        # downgrade severity one level for uncertain findings
+        downgrade = {"critical":"high","high":"medium","medium":"low","low":"info","info":"info"}
+        result["adjusted_severity"] = downgrade.get(severity, severity)
+    else:
+        result["confidence"] = "filtered"
+        result["fp_reason"]  = result["fp_reason"] or "Low confidence — likely false positive"
+
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FALSE NEGATIVE REDUCTION ENGINE
+#
+#  False negatives = real secrets we MISSED because our regex was too strict.
+#  This engine adds a second pass with broader, fuzzier patterns to catch
+#  things the main patterns might have missed.
+#
+#  These looser patterns would create too much noise as primary patterns,
+#  but run AFTER the main pass they only fire on things not already found.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# broader catch-all patterns for the second pass
+# these are intentionally looser than the main patterns
+FN_BROAD_PATTERNS = [
+    # any long (32+) alphanumeric string assigned to a key/token/secret variable
+    (r'(?:key|token|secret|password|auth|cred)[s_\-]?\s*[=:]\s*["\']([A-Za-z0-9_\-\.+/]{32,})["\']', "high",
+     "Long string assigned to sensitive variable name"),
+
+    # anything that looks like base64 (long, ends with =)
+    (r'["\']([A-Za-z0-9+/]{40,}={1,2})["\']', "medium",
+     "Long base64-encoded string — may contain encoded credentials"),
+
+    # hex strings 32+ chars (MD5/SHA hashes or tokens)
+    (r'["\']([0-9a-f]{32,})["\']', "low",
+     "Long hex string — may be a token or hash"),
+
+    # anything after 'Authorization:' header construction
+    (r'["\']Authorization["\']?\s*[,:]?\s*["\']?(Bearer|Basic|Token)\s+([A-Za-z0-9_\-\.+/=]{16,})', "high",
+     "Authorization header with inline token"),
+
+    # URL with credentials embedded
+    (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%^&*]{4,}@', "critical",
+     "URL with embedded credentials (user:pass@host)"),
+
+    # private key in variable
+    (r'(?:private|priv)[_\-]?key\s*=\s*["\']([^"\']{20,})["\']', "critical",
+     "Private key assigned to variable"),
+
+    # JWT token pattern (three base64 parts separated by dots)
+    (r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', "high",
+     "JWT token detected (three-part base64 structure)"),
+
+    # GCP service account key pattern
+    (r'"type"\s*:\s*"service_account"', "critical",
+     "Google Cloud service account JSON key"),
+
+    # Slack webhook URL
+    (r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[A-Za-z0-9]+', "high",
+     "Slack webhook URL — can post messages to Slack channels"),
+
+    # GitHub personal access token
+    (r'gh[pousr]_[A-Za-z0-9]{36,}', "critical",
+     "GitHub personal access token"),
+
+    # npm token
+    (r'npm_[A-Za-z0-9]{36,}', "high",
+     "NPM access token"),
+]
+
+
+def run_false_negative_pass(content, lines, already_found_hashes, source_domain=""):
+    """
+    Second analysis pass with broader patterns to catch things the main
+    patterns might have missed.
+
+    Skips anything already found in the main pass (by hash).
+    Runs each match through the confidence scorer — only returns
+    findings with confidence >= 'possible'.
+    """
+    fn_findings = []
+
+    for pattern, severity, description in FN_BROAD_PATTERNS:
+        try:
+            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                matched_str = match.group(0)[:120]
+                line_num    = content[:match.start()].count("\n") + 1
+                line_ctx    = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+
+                # skip if main pass already caught this
+                dedup_key = hashlib.md5(f"fn_pass{matched_str}".encode()).hexdigest()
+                if dedup_key in already_found_hashes:
+                    continue
+                already_found_hashes.add(dedup_key)
+
+                # run through confidence engine
+                conf = assess_finding_confidence(
+                    matched_str, line_ctx, "Broad Pattern", severity, source_domain
+                )
+
+                # only keep if confidence is at least 'possible'
+                if conf["confidence"] == "filtered":
+                    continue
+
+                fn_findings.append({
+                    "category":          "Additional Findings (Broad Pass)",
+                    "severity":          conf["adjusted_severity"],
+                    "match":             matched_str,
+                    "line":              line_num,
+                    "context":           line_ctx,
+                    "source_domain":     source_domain,
+                    "fn_description":    description,
+                    "confidence":        conf["confidence"],
+                    "confidence_score":  conf["confidence_score"],
+                })
+
+        except re.error:
+            continue
+
+    return fn_findings
+
+
 
 def extract_js_from_page(url, session, waf_aware=False):
     js_files    = set()
@@ -876,19 +1320,49 @@ def analyze_js_content(url, content, beautify=False, source_domain=""):
                     if dedup_key in seen_findings:
                         continue
                     seen_findings.add(dedup_key)
+
+                    # ── run through false positive reduction engine ──────
+                    # every finding is scored for confidence before we keep it
+                    conf = assess_finding_confidence(
+                        matched_str, line_ctx, category, severity,
+                        source_domain=results["source_domain"]
+                    )
+
+                    # drop anything the engine marked as a false positive
+                    if conf["confidence"] == "filtered":
+                        continue
+
+                    # use the (potentially downgraded) adjusted severity
+                    effective_severity = conf["adjusted_severity"]
+
                     results["findings"].append({
-                        "category":      category,
-                        "severity":      severity,
-                        "match":         matched_str,
-                        "line":          line_num,
-                        "context":       line_ctx,
-                        "source_domain": results["source_domain"],
-                        "source_file":   url,
+                        "category":         category,
+                        "severity":         effective_severity,
+                        "original_severity":severity,
+                        "match":            matched_str,
+                        "line":             line_num,
+                        "context":          line_ctx,
+                        "source_domain":    results["source_domain"],
+                        "source_file":      url,
+                        "confidence":       conf["confidence"],
+                        "confidence_score": conf["confidence_score"],
+                        "fp_reason":        conf["fp_reason"],
                     })
                     score_map = {"critical":100,"high":50,"medium":20,"low":5,"info":1}
-                    results["score"] += score_map.get(severity, 1)
+                    results["score"] += score_map.get(effective_severity, 1)
             except re.error:
                 continue
+
+    # ── false negative reduction pass ───────────────────────────────────
+    # run broader patterns to catch things the main pass might have missed
+    fn_findings = run_false_negative_pass(
+        content, lines, seen_findings,
+        source_domain=results["source_domain"]
+    )
+    results["findings"].extend(fn_findings)
+    score_map = {"critical":100,"high":50,"medium":20,"low":5,"info":1}
+    for f in fn_findings:
+        results["score"] += score_map.get(f["severity"], 1)
 
     # endpoints
     for pat in [
@@ -1079,13 +1553,35 @@ def print_analysis(results, show_endpoints=True):
             fg      = SEVERITY_FG.get(sev, "")
             icon    = SEVERITY_ICONS.get(sev, "")
             sev_tag = f" {sev.upper():<8} "
-            # attribute every finding to its domain and file clearly
+
+            # confidence label — shown next to each finding so users know how much to trust it
+            conf       = f.get("confidence", "")
+            conf_score = f.get("confidence_score", 0)
+            if conf == "confirmed":
+                conf_label = f"{FG_SUCCESS}[✓ CONFIRMED]{RESET}"
+            elif conf == "likely":
+                conf_label = f"{FG_MEDIUM}[~ LIKELY]{RESET}"
+            elif conf == "possible":
+                conf_label = f"{FG_DIM}[? POSSIBLE]{RESET}"
+            else:
+                conf_label = ""
+
             print(f"    {badge}{sev_tag}{RESET} {icon} "
                   f"{FG_DIM}L{f['line']:4d}{RESET}  "
-                  f"{fg}{f['match'][:w-40]}{RESET}")
+                  f"{fg}{f['match'][:w-50]}{RESET}  {conf_label}")
+
+            # show context line
             if f["context"] and f["context"].strip() != f["match"].strip():
                 ctx = f["context"][:w-16]
                 print(f"    {FG_DIM}{'':13}→ {ctx}{RESET}")
+
+            # if confidence was downgraded, explain why
+            if f.get("fp_reason") and conf in ["possible"]:
+                print(f"    {FG_DIM}{'':13}⚠ Note: {f['fp_reason'][:w-20]}{RESET}")
+
+            # show FN broad-pass description if it came from that pass
+            if f.get("fn_description"):
+                print(f"    {FG_DIM}{'':13}⟫ {f['fn_description']}{RESET}")
 
     if show_endpoints and results["endpoints"]:
         print(f"\n  {FG_SECTION}▸ Endpoints ({len(results['endpoints'])}){RESET}")
@@ -1526,9 +2022,13 @@ def build_parser():
     tg.add_argument("--burp-paste",metavar="TEXT",
                                    help="Paste Burp JS URLs directly as a string argument")
 
-    vg = parser.add_argument_group("Version & Info")
+    vg = parser.add_argument_group("Version & Updates")
     vg.add_argument("--version","-V", action="store_true",
                     help="Show version info and check for updates")
+    vg.add_argument("--update",       action="store_true",
+                    help="Update JSReaper to the latest version from GitHub.\n"
+                         "Backs up the current script before replacing it.\n"
+                         "Example:  jsreaper --update")
 
     sg = parser.add_argument_group("Scan Options")
     sg.add_argument("--analyze",    action="store_true",
@@ -1590,6 +2090,11 @@ def main():
     # version check — early exit
     if args.version:
         check_version()
+        sys.exit(0)
+
+    # self-update — early exit
+    if args.update:
+        self_update()
         sys.exit(0)
 
     # collect targets from all possible sources
