@@ -3,12 +3,12 @@
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                         JSReaper v2.1                               ║
-# ║         JavaScript Recon & Analysis Tool for Bug Bounty             ║
+# ║         JavaScript Recon & Analysis Tool for Security Research             ║
 # ║                                                                      ║
 # ║  Written by @dr34lm                                                  ║
 # ║  Twitter/X: https://x.com/dr34lm                                    ║
 # ║                                                                      ║
-# ║  Built for bug bounty hunters who need deep JS recon fast.          ║
+# ║  Built for security researchers, educators, and bug bounty hunters.          ║
 # ║  For educational and research purposes only.                         ║
 # ║  Use only on targets you are authorized to test.                     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
@@ -188,23 +188,26 @@ def box_line(text, color=FG_DIM):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_banner():
+    # Clean upright block-style banner — portrait, bold, readable.
+    # Each letter is 6 rows tall, built from # characters.
+    # Gradient: lemon top, lime middle, mint bottom.
     v = TOOL_VERSION
-    lines = [
-        LEMON + r"       ___  ________      ________  _______   ________  ________  _______   ________     ",
-        LEMON + r"      /\  \/\   ____\    /\   __  \/\  ___ \ /\   __  \/\   __  \/\  ___ \ /\   __  \    ",
-        LIME  + r"      \ \  \ \  \___|    \ \  \|\  \ \   __/|\ \  \|\  \ \  \|\  \ \   __/|\ \  \|\  \   ",
-        LIME  + r"    __ \ \  \ \_____  __ \ \   _  _\ \  \_|/_\ \   __  \ \   ____\ \  \_|/_\ \   _  _\  ",
-        MINT  + r"   /\ \_\  \  \|____|\  \/\ \  \\  \\ \  \_|\ \ \  \ \  \ \  \___|\ \  \_|\ \ \  \\  \| ",
-        MINT  + r"   \ \________\____\_\  \ \ \__\\ _\\ \_______\ \__\ \__\ \__\    \ \_______\ \__\\ _\ ",
-        MINT  + r"    \|________|\_________\ \|__|\|__|\|_______|\|__|\|__|\|__|     \|_______|\|__|\|__|",
-        LEMON + r"               \|_________|                                                              ",
+    rows = [
+        "      ######    #####    ######    #######    ####    ######    #######   ######   ",
+        "        ##     ##       ##   ##    ##        ##  ##   ##   ##   ##        ##   ##  ",
+        "        ##      ####    ##   ##    #####    ##    ##  ##   ##   #####     ##   ##  ",
+        "        ##          ##  ######     ##       ########  ######    ##        ######   ",
+        "   ##   ##          ##  ## ##      ##       ##    ##  ##        ##        ## ##    ",
+        "    #####       ####    ##  ##     #######  ##    ##  ##        #######   ##  ##   ",
     ]
+    row_colors = [LEMON, LEMON, LIME, LIME, MINT, MINT]
     out = "\n"
-    for l in lines:
-        out += l + RESET + "\n"
-    out += f"\n{GOLD}          ⚡  JavaScript Recon & Analysis Tool  v{v}\n"
-    out += f"{GRAY}          ◈   Linux | macOS | Windows  —  Python 3.7+\n"
-    out += f"{GRAY}          ✦   Written by @dr34lm  |  Research & Educational Use Only\n"
+    for i, row in enumerate(rows):
+        out += row_colors[i] + row + RESET + "\n"
+    out += "\n"
+    out += GOLD  + "          ⚡  JavaScript Recon & Analysis Tool  v" + v + "\n"
+    out += GRAY  + "          ◈   Linux | macOS | Windows  —  Python 3.7+" + "\n"
+    out += GRAY  + "          ✦   Written by @dr34lm  |  Research & Educational Use Only" + "\n"
     out += RESET
     return out
 
@@ -224,7 +227,7 @@ def check_version():
     print(f"    {FG_DIM}Tool   :{RESET} {FG_SUCCESS}{TOOL_NAME}{RESET}")
     print(f"    {FG_DIM}Version:{RESET} {FG_SUCCESS}v{TOOL_VERSION}{RESET}")
     print(f"    {FG_DIM}Author :{RESET} {FG_URL}@dr34lm  —  https://x.com/dr34lm{RESET}")
-    print(f"    {FG_DIM}Purpose:{RESET} Bug bounty recon — research & educational use")
+    print(f"    {FG_DIM}Purpose:{RESET} Security research & educational use")
     print(f"    {FG_DIM}OS     :{RESET} {platform.system()} {platform.release()}")
     print(f"    {FG_DIM}Python :{RESET} {platform.python_version()}")
 
