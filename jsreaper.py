@@ -38,7 +38,7 @@ from urllib.parse import urljoin, urlparse
 from collections import defaultdict
 import threading
 
-TOOL_VERSION = "2.3"
+TOOL_VERSION = "2.4"
 TOOL_NAME    = "JSReaper"
 
 # GitHub URLs used by --version and --update
@@ -3168,13 +3168,14 @@ def reason_about_file(res):
 
 def generate_executive_summary(domain, all_analysis, base_url, session):
     """
-    Cross-file executive summary — the top-level picture.
+    The full DeepSeek-style intelligence report.
 
-    This is what DeepSeek gave at the end:
-    - Overall verdict: worth your time or not?
-    - What the JS files reveal about the backend
-    - Proactive recon steps not in the JS (but logically implied)
-    - Bug bounty reportability assessment
+    Does five things no other JS tool does:
+    1. Honest verdict per file — library vs custom, worth time or not
+    2. True negative explanation — WHY something is NOT a finding
+    3. True positive confidence — WHY something IS worth reporting
+    4. Backend inference — what the JS libraries tell us about the server
+    5. Ready-to-run bash recon script saved to disk
     """
     worth_files      = []
     library_files    = []
@@ -3184,179 +3185,416 @@ def generate_executive_summary(domain, all_analysis, base_url, session):
     all_src_maps     = []
     all_technologies = set()
     total_score      = 0
+    lib_names        = []   # track which libraries were found for specific advice
 
     for res in all_analysis:
         reasoning = reason_about_file(res)
         total_score += res.get("score", 0)
+        fname = res["url"].split("/")[-1].lower()
         if res.get("library_file"):
             library_files.append(res["url"])
+            lib_names.append(fname)
         elif reasoning["worth"]:
             worth_files.append((res["url"], reasoning))
+        else:
+            # even clean app files get noted
+            pass
         all_secrets.extend(res.get("precision_secrets", []))
         all_constructors.extend(res.get("url_constructors", []))
         all_src_maps.extend(res.get("source_maps", []))
         all_technologies.update(res.get("technologies", {}).keys())
-
-    # check for 404 JS files (broken assets — sometimes interesting)
-    for res in all_analysis:
         if res.get("size", 0) == 0:
             missing_files.append(res["url"])
 
-    w = term_width()
+    w          = term_width()
+    all_lib    = len(library_files) == len(all_analysis) and len(all_analysis) > 0
+    has_custom = len(all_analysis) - len(library_files) > 0
 
+    # ─────────────────────────────────────────────────────────────────────
     section_header(f"EXECUTIVE SUMMARY: {domain}", LEMON)
 
-    print(f"  {FG_DIM}{'─'*40}")
-    print(f"  FILES ANALYSED{RESET}")
-    print(f"  {FG_DIM}Total JS files   :{RESET} {len(all_analysis)}")
-    print(f"  {FG_DIM}Library files    :{RESET} {FG_DIM}{len(library_files)} (skipped — known safe libraries){RESET}")
-    print(f"  {FG_DIM}App files        :{RESET} {FG_URL}{len(all_analysis) - len(library_files)}{RESET}")
-    print(f"  {FG_DIM}Files with hits  :{RESET} {FG_HIGH}{len(worth_files)}{RESET}")
+    # ── FILE BREAKDOWN ────────────────────────────────────────────────────
+    print(f"  {FG_DIM}Files analyzed   :{RESET} {len(all_analysis)}")
+    print(f"  {FG_DIM}Libraries (safe) :{RESET} {FG_DIM}{len(library_files)}{RESET}")
+    print(f"  {FG_DIM}Custom app files :{RESET} {FG_URL}{len(all_analysis)-len(library_files)}{RESET}")
     if missing_files:
-        print(f"  {FG_DIM}Missing (404)    :{RESET} {FG_MEDIUM}{len(missing_files)}{RESET}")
+        print(f"  {FG_DIM}Missing (404)    :{RESET} {FG_MEDIUM}{len(missing_files)} — see note below{RESET}")
     print()
 
-    # overall verdict
-    if all_secrets:
-        crit = [s for s in all_secrets if s["severity"] == "critical"]
-        if crit:
-            print(f"  {C_CRITICAL} VERDICT: CRITICAL FINDINGS — REPORT IMMEDIATELY {RESET}")
-        else:
-            print(f"  {C_HIGH} VERDICT: HIGH PRIORITY FINDINGS FOUND {RESET}")
+    # ── OVERALL VERDICT ───────────────────────────────────────────────────
+    crit_secrets = [s for s in all_secrets if s["severity"] == "critical"]
+    high_secrets = [s for s in all_secrets if s["severity"] == "high"]
+
+    if crit_secrets:
+        print(f"  {C_CRITICAL} VERDICT: CRITICAL — REPORT IMMEDIATELY {RESET}\n")
+    elif high_secrets or (worth_files and total_score >= 80):
+        print(f"  {C_HIGH} VERDICT: HIGH PRIORITY FINDINGS — WORTH INVESTIGATING {RESET}\n")
     elif worth_files:
-        print(f"  {C_MEDIUM} VERDICT: INTERESTING FINDINGS — WORTH INVESTIGATING {RESET}")
+        print(f"  {C_MEDIUM} VERDICT: MEDIUM — SOME INTERESTING PATTERNS FOUND {RESET}\n")
+    elif all_lib:
+        print(f"  {FG_SUCCESS}  VERDICT: NOTHING IN JS FILES — ALL LIBRARIES {RESET}")
+        print(f"  {FG_DIM}  These JS files are 100% third-party libraries:")
+        print(f"  {FG_DIM}  ✓ No backend logic  ✓ No database queries")
+        print(f"  {FG_DIM}  ✓ No file operations  ✓ No authentication code")
+        print(f"  {FG_DIM}  Real vulnerabilities live in the backend — run the recon script below.{RESET}\n")
     else:
-        print(f"  {FG_SUCCESS}  VERDICT: NO HIGH-VALUE FINDINGS IN JS FILES{RESET}")
-        print(f"  {FG_DIM}  The JS files are standard libraries or contain no sensitive data.{RESET}")
-        print(f"  {FG_DIM}  Real vulnerabilities (if any) are in the backend — see recon steps below.{RESET}")
+        print(f"  {FG_SUCCESS}  VERDICT: NOTHING SIGNIFICANT FOUND IN JS FILES {RESET}\n")
+
+    # ── PER-FILE REASONING ────────────────────────────────────────────────
+    print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+    print(f"  FILE-BY-FILE ANALYSIS\n")
+
+    for res in all_analysis:
+        fname    = res["url"].split("/")[-1]
+        is_lib   = res.get("library_file", False)
+        size     = res.get("size", 0)
+        score    = res.get("score", 0)
+        techs    = list(res.get("technologies", {}).keys())
+        prec     = res.get("precision_secrets", [])
+        constrs  = res.get("url_constructors", [])
+
+        if is_lib:
+            # Clear true-negative explanation — WHY this file is safe
+            reason = res.get("library_reason", "known library")
+            print(f"  {FG_DIM}  ✗ {fname:<45} SKIP — {reason}{RESET}")
+        elif size == 0:
+            print(f"  {FG_MEDIUM}  ? {fname:<45} 404 — file missing (see note){RESET}")
+        elif prec:
+            crit = [s for s in prec if s["severity"]=="critical"]
+            high = [s for s in prec if s["severity"]=="high"]
+            color = FG_CRITICAL if crit else FG_HIGH
+            tag   = "CRITICAL SECRET" if crit else "HIGH — SECRET FOUND"
+            print(f"  {color}  ✓ {fname:<45} {tag}{RESET}")
+            for s in (crit or high)[:2]:
+                print(f"    {FG_DIM}  → {s['service']} at line {s['line']}: {s['match'][:50]}{RESET}")
+        elif constrs:
+            print(f"  {FG_MEDIUM}  ✓ {fname:<45} API CONSTRUCTOR FOUND{RESET}")
+            for c in constrs[:2]:
+                print(f"    {FG_DIM}  → endpoint pattern: {c['endpoint']}{RESET}")
+        elif score > 0:
+            print(f"  {FG_LOW}  ~ {fname:<45} LOW SCORE ({score}) — check manually{RESET}")
+        else:
+            print(f"  {FG_SUCCESS}  ✓ {fname:<45} CLEAN — no findings{RESET}")
     print()
 
-    # tech stack insight
-    if all_technologies:
-        print(f"  {FG_DIM}{'─'*40}")
-        print(f"  TECHNOLOGY STACK DETECTED{RESET}")
-        print(f"  {FG_TECH}{', '.join(sorted(all_technologies))}{RESET}")
-        # give backend inference
-        if "WordPress" in all_technologies:
-            print(f"  {FG_MEDIUM}  → WordPress detected: check /wp-json/wp/v2/users for user enumeration{RESET}")
-            print(f"  {FG_MEDIUM}  → Check for vulnerable plugins: /wp-content/plugins/{RESET}")
-        if "GraphQL" in all_technologies:
-            print(f"  {FG_MEDIUM}  → GraphQL detected: test for introspection at /graphql{RESET}")
-        if "Firebase" in all_technologies:
-            print(f"  {FG_HIGH}  → Firebase detected: check for unauthenticated database rules{RESET}")
-        print()
+    # ── TECHNOLOGY BACKEND INFERENCE ─────────────────────────────────────
+    # This is key — what do the libraries tell us about the backend?
+    if all_technologies or lib_names:
+        print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+        print(f"  BACKEND INFERENCE FROM LIBRARIES\n")
 
-    # per-file verdicts
-    if worth_files:
-        print(f"  {FG_DIM}{'─'*40}")
-        print(f"  FILE-BY-FILE VERDICTS{RESET}")
-        for file_url, reasoning in worth_files:
-            fname  = file_url.split("/")[-1]
-            vcolor = FG_CRITICAL if "CRITICAL" in reasoning["verdict"] else FG_HIGH if "HIGH" in reasoning["verdict"] else FG_MEDIUM
-            print(f"  {vcolor}▸ {fname}{RESET}")
-            print(f"    {FG_DIM}Verdict:{RESET} {vcolor}{reasoning['verdict']}{RESET}")
-            for r in reasoning["reasons"][:2]:
-                print(f"    {FG_DIM}→ {r[:w-8]}{RESET}")
+        inferences = []
+
+        # detect from library filenames
+        lib_str = " ".join(lib_names).lower()
+        tech_str = " ".join(all_technologies).lower()
+        combined = lib_str + " " + tech_str
+
+        if "wordpress" in combined or "wp-" in combined:
+            inferences.append(("WordPress CMS detected",
+                "high",
+                ["Check /wp-json/wp/v2/users — exposes usernames",
+                 "Check /wp-login.php — test for credential stuffing",
+                 "Run WPScan: wpscan --url https://" + domain,
+                 "Check /xmlrpc.php — test for brute force amplification"]))
+
+        if "jquery" in combined:
+            inferences.append(("jQuery detected — DOM manipulation library",
+                "low",
+                ["jQuery itself is safe — no backend exposure",
+                 "However: any site input reflected in DOM = potential XSS",
+                 "Test: search box, comment fields, URL params with: \"><script>alert(1)</script>"]))
+
+        if "bootstrap" in combined:
+            inferences.append(("Bootstrap detected — UI framework",
+                "low",
+                ["Bootstrap is safe — no backend exposure",
+                 "data-* attributes may be user-controlled — test for XSS injection",
+                 "Example: data-bs-target=javascript:alert(1)"]))
+
+        if "swiper" in combined or "slider" in combined:
+            inferences.append(("Slider/carousel library detected",
+                "info",
+                ["These are purely presentational — no attack surface"]))
+
+        if "toastr" in combined or "notification" in combined:
+            inferences.append(("Notification library detected",
+                "low",
+                ["Notification text may come from server — test for stored XSS",
+                 "Check: does any user input appear in notification messages?"]))
+
+        if "aos" in combined or "animate" in combined:
+            inferences.append(("Animation library detected",
+                "info",
+                ["Purely presentational — no attack surface"]))
+
+        if "graphql" in tech_str:
+            inferences.append(("GraphQL detected",
+                "high",
+                ["Test introspection: POST /graphql {query: '{__schema{types{name}}}'}",
+                 "Introspection enabled = full schema exposed",
+                 "Use graphql-cop or graphw00f for automated testing"]))
+
+        if "firebase" in tech_str:
+            inferences.append(("Firebase detected",
+                "high",
+                ["Check for publicly readable Firestore/RTDB rules",
+                 "Test: GET https://[project].firebaseio.com/.json",
+                 "200 response = unauthenticated database access (Critical)"]))
+
+        if "stripe" in tech_str:
+            inferences.append(("Stripe payment library detected",
+                "medium",
+                ["Check for test mode keys (sk_test_) — still a finding",
+                 "Check for publishable key (pk_live_) in JS",
+                 "Publishable keys are OK to expose — secret keys (sk_live_) are not"]))
+
+        if not inferences:
+            inferences.append(("Standard frontend libraries",
+                "info",
+                ["No backend-specific technology detected from JS files",
+                 "Run manual recon steps below to discover backend attack surface"]))
+
+        for title, severity, points in inferences:
+            color = FG_HIGH if severity=="high" else FG_MEDIUM if severity=="medium" else FG_LOW if severity=="low" else FG_DIM
+            print(f"  {color}▸ {title}{RESET}")
+            for p in points:
+                print(f"    {FG_DIM}→ {p[:w-8]}{RESET}")
             print()
 
-    # proactive recon steps — things NOT in the JS but implied
-    print(f"  {FG_DIM}{'─'*40}")
-    print(f"  PROACTIVE RECON STEPS")
-    print(f"  {FG_DIM}  Based on what was found (and not found), run these checks:{RESET}\n")
-
-    recon = []
-
-    # always check these
-    recon.append(("ALWAYS", "medium",
-                  f"Directory listing check",
-                  f"GET https://{domain}/assets/",
-                  "If server returns file list = Information Disclosure"))
-
-    recon.append(("ALWAYS", "critical",
-                  "Exposed Git repository",
-                  f"GET https://{domain}/.git/HEAD",
-                  "200 response = full source code accessible (Critical)"))
-
-    recon.append(("ALWAYS", "critical",
-                  "Environment file exposed",
-                  f"GET https://{domain}/.env",
-                  "200 response = database credentials, API keys exposed (Critical)"))
-
-    recon.append(("ALWAYS", "high",
-                  "Source maps accessible",
-                  f"GET https://{domain}/assets/frontend/js/script.js.map",
-                  "200 JSON response = full unminified source code"))
-
-    # add source maps from JS files
-    for sm in all_src_maps[:3]:
-        recon.append(("SOURCE MAP", "medium",
-                      "Source map from JS reference",
-                      f"GET {sm}",
-                      "200 JSON = source code exposure"))
-
-    # add API endpoints from constructors
-    for c in all_constructors[:5]:
-        ep = c["endpoint"]
-        recon.append(("API ENDPOINT", "high",
-                      f"Discovered endpoint: {ep}",
-                      f"GET https://{domain}{ep}",
-                      "Test for auth bypass — try without session cookie"))
-
-    # tech-specific checks
-    if "WordPress" in all_technologies:
-        recon.append(("WORDPRESS", "medium",
-                      "User enumeration via REST API",
-                      f"GET https://{domain}/wp-json/wp/v2/users",
-                      "Returns usernames = valid for credential stuffing"))
-        recon.append(("WORDPRESS", "high",
-                      "xmlrpc.php brute force vector",
-                      f"POST https://{domain}/xmlrpc.php",
-                      "Enabled = brute force amplification possible"))
-
-    recon.append(("ALWAYS", "medium",
-                  "Backup files",
-                  f"GET https://{domain}/wp-config.php.bak  (also try .env.backup, config.php.bak)",
-                  "200 = credentials exposed"))
-
-    recon.append(("ALWAYS", "medium",
-                  "Robots.txt — hidden paths",
-                  f"GET https://{domain}/robots.txt",
-                  "Disallowed entries reveal hidden admin/API paths"))
-
-    for category, severity, title, test_url, why in recon:
-        sev_color = FG_CRITICAL if severity=="critical" else FG_HIGH if severity=="high" else FG_MEDIUM
-        badge     = SEVERITY_BADGE.get(severity, "")
-        print(f"  {badge} {severity.upper():<8} {RESET}  {FG_DIM}{title}{RESET}")
-        print(f"    {sev_color}{test_url}{RESET}")
-        print(f"    {FG_DIM}-> {why}{RESET}\n")
-
-    # 404 file note
+    # ── 404 FILE ANALYSIS ─────────────────────────────────────────────────
     if missing_files:
-        print(f"  {FG_DIM}{'─'*40}")
-        print(f"  MISSING FILES (404) — Usually Not Reportable{RESET}")
-        print(f"  {FG_DIM}  404 errors are NOT bugs unless they reveal directory structure")
-        print(f"  or the missing file was something sensitive (config, backup, etc.).{RESET}")
+        print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+        print(f"  MISSING FILES (404) — WHY THIS IS USUALLY NOT REPORTABLE\n")
+        print(f"  {FG_DIM}  404 errors are NOT vulnerabilities. A missing file means:{RESET}")
+        print(f"  {FG_DIM}  • The feature was removed or never deployed{RESET}")
+        print(f"  {FG_DIM}  • A typo in the HTML source (missing .js extension, wrong path){RESET}")
+        print(f"  {FG_DIM}  • The file was intentionally deleted{RESET}")
+        print(f"  {FG_DIM}  Exception: 404 on a backup/config file (.env, .git) is good news — means{RESET}")
+        print(f"  {FG_DIM}  it doesn't exist publicly. Only report 200 responses for those.{RESET}\n")
         for mf in missing_files[:5]:
-            print(f"    {FG_DIM}✗ {mf.split('/')[-1]}{RESET}")
+            fname = mf.split("/")[-1]
+            print(f"    {FG_DIM}✗ {fname} — 404, not reportable{RESET}")
         print()
 
-    # final guidance
-    print(f"  {FG_DIM}{'─'*40}")
-    all_lib = len(library_files) == len(all_analysis)
-    if all_lib:
-        print(f"  {FG_DIM}ALL FILES ARE LIBRARIES{RESET}")
-        print(f"  {FG_DIM}  None of these JS files contain application logic.")
-        print(f"  {FG_DIM}  The real attack surface is in the backend — use the recon steps above.")
-        print(f"  {FG_DIM}  Focus on: .git, .env, API endpoints, admin panels.{RESET}")
-    elif all_secrets:
-        print(f"  {FG_HIGH}  HIGH PRIORITY: Verify the secrets found above are active credentials.")
-        print(f"  {FG_HIGH}  If confirmed active = Critical/High severity report.{RESET}")
-    elif worth_files:
-        print(f"  {FG_MEDIUM}  NEXT STEP: Manually review the flagged files and run the test cases above.")
-        print(f"  {FG_MEDIUM}  Use Burp Suite to intercept and test the discovered API endpoints.{RESET}")
+    # ── RANKED NEXT STEPS ─────────────────────────────────────────────────
+    print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+    print(f"  RANKED NEXT STEPS — BY PRIORITY\n")
+
+    steps = []
+
+    # Critical priority — always check these first
+    steps.append((1, "critical", "Check for exposed .git repository",
+                  f"curl -s https://{domain}/.git/HEAD",
+                  "200 + 'ref: refs/heads/' = Critical. Run: git-dumper https://{domain}/.git ./source"))
+
+    steps.append((2, "critical", "Check for exposed .env file",
+                  f"curl -s -o /dev/null -w '%{{http_code}}' https://{domain}/.env",
+                  "200 = Critical. Contains DB credentials, API keys, app secrets"))
+
+    steps.append((3, "high", "Check for backup/config files",
+                  f"for f in wp-config.php.bak .env.backup config.php.bak database.yml; do\n"
+                  f"    curl -s -o /dev/null -w \"$f: %{{http_code}}\\n\" https://{domain}/$f\n"
+                  f"  done",
+                  "200 = credentials exposed"))
+
+    steps.append((4, "medium", "Check robots.txt for hidden paths",
+                  f"curl -s https://{domain}/robots.txt",
+                  "Disallow entries reveal admin panels, API paths, hidden sections"))
+
+    # WordPress-specific
+    if "WordPress" in all_technologies or "wordpress" in " ".join(lib_names).lower():
+        steps.append((5, "high", "WordPress user enumeration",
+                      f"curl -s https://{domain}/wp-json/wp/v2/users | python3 -m json.tool",
+                      "Returns usernames = use for targeted password attacks"))
+        steps.append((6, "high", "WordPress xmlrpc brute force check",
+                      f"curl -s -o /dev/null -w '%{{http_code}}' https://{domain}/xmlrpc.php",
+                      "200 = enabled. Allows amplified brute force (1 req = 100 attempts)"))
+        steps.append((7, "medium", "WordPress version disclosure",
+                      f"curl -s https://{domain}/ | grep -i 'generator.*wordpress'",
+                      "Version in HTML = check for known CVEs at wpscan.com"))
+
+    # Source map checks
+    for sm in all_src_maps[:2]:
+        steps.append((8, "medium", f"Source map accessible: {sm.split('/')[-1]}",
+                      f"curl -s -o /dev/null -w '%{{http_code}}' {sm}",
+                      "200 + JSON = full unminified source code exposed (Information Disclosure)"))
+
+    # API endpoint checks from constructors
+    for c in all_constructors[:3]:
+        ep = c["endpoint"].rstrip("*")
+        steps.append((9, "high", f"Discovered API endpoint: {ep}",
+                      f"curl -s -o /dev/null -w '%{{http_code}}' https://{domain}{ep}",
+                      "Test without auth cookie. 200 = unauthenticated access"))
+
+    # Generic injection tests
+    steps.append((10, "medium", "SQL injection in search/input fields",
+                  f"curl -s \"https://{domain}/?s=test%27\" | grep -iE 'sql|mysql|syntax|warning'",
+                  "Error message = likely SQLi. Use sqlmap for confirmation"))
+
+    steps.append((11, "medium", "XSS in search/input fields",
+                  f"curl -s \"https://{domain}/?s=%3Cscript%3Ealert(1)%3C/script%3E\" | grep -i '<script>alert'",
+                  "Reflected payload = DOM XSS. Test all input fields"))
+
+    steps.append((12, "medium", "Directory listing check",
+                  f"curl -s -o /dev/null -w '%{{http_code}}' https://{domain}/assets/",
+                  "200 with HTML listing = Information Disclosure"))
+
+    steps.append((13, "low", "LFI via common parameters",
+                  f"curl -s \"https://{domain}/index.php?page=../../../../etc/passwd\"",
+                  "root: in response = LFI confirmed (Critical)"))
+
+    # Sort by priority and print
+    steps.sort(key=lambda x: x[0])
+    for num, severity, title, cmd, why in steps[:12]:
+        badge = SEVERITY_BADGE.get(severity, "")
+        color = FG_CRITICAL if severity=="critical" else FG_HIGH if severity=="high" else FG_MEDIUM if severity=="medium" else FG_LOW
+        print(f"  {badge} #{num:<2} {title[:w-20]} {RESET}")
+        print(f"    {color}{cmd[:w-4]}{RESET}")
+        print(f"    {FG_DIM}→ {why[:w-6]}{RESET}\n")
+
+    # ── BASH RECON SCRIPT ─────────────────────────────────────────────────
+    # Save a ready-to-run bash script — exactly what DeepSeek generated
+    script_path = f"/tmp/jsreaper_recon_{domain.replace('.','_')}.sh"
+    try:
+        bash_lines = [
+            "#!/bin/bash",
+            f"# JSReaper Auto-Generated Recon Script",
+            f"# Target: {domain}",
+            f"# Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Run with: chmod +x {script_path} && {script_path}",
+            "",
+            f'BASE="https://{domain}"',
+            "",
+            'echo "================================================"',
+            f'echo "[*] JSReaper Recon Script for {domain}"',
+            'echo "================================================"',
+            "",
+            'echo ""',
+            'echo "[*] 1. Checking for exposed sensitive files..."',
+            'for file in .env .env.backup .env.local .git/HEAD .git/config wp-config.php.bak config.php.bak database.yml debug.log phpinfo.php .htaccess; do',
+            '    CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$file")',
+            '    if [ "$CODE" = "200" ]; then',
+            '        echo "  [!!!] FOUND: $BASE/$file (HTTP $CODE)"',
+            '    else',
+            '        echo "  [ ] $file ($CODE)"',
+            '    fi',
+            'done',
+            "",
+            'echo ""',
+            'echo "[*] 2. Directory listing check..."',
+        ]
+
+        # add JS file directories
+        js_dirs = set()
+        for res in all_analysis:
+            parts = res["url"].split("/")
+            if len(parts) > 4:
+                js_dirs.add("/".join(parts[:-1]) + "/")
+        for d in list(js_dirs)[:3]:
+            bash_lines.append(f'curl -s -o /dev/null -w "  {d}: %{{http_code}}\\n" "{d}"')
+
+        bash_lines += [
+            "",
+            'echo ""',
+            'echo "[*] 3. Robots.txt check..."',
+            'curl -s "$BASE/robots.txt" | head -30',
+            "",
+            'echo ""',
+            'echo "[*] 4. SQLi test in search..."',
+            "CODE=$(curl -s \"$BASE/?s=test%27\" | grep -ic 'sql\\|mysql\\|syntax\\|warning\\|error')",
+            'if [ "$CODE" -gt "0" ]; then',
+            '    echo "  [!] Possible SQLi — error keywords found in response"',
+            'else',
+            '    echo "  [ ] No obvious SQLi errors"',
+            'fi',
+            "",
+            'echo ""',
+            'echo "[*] 5. XSS reflection test..."',
+            'RESULT=$(curl -s "$BASE/?s=%3Cscript%3Ealert%281%29%3C%2Fscript%3E")',
+            'if echo "$RESULT" | grep -qi "<script>alert(1)</script>"; then',
+            '    echo "  [!] XSS REFLECTED — payload echoed back in response"',
+            'else',
+            '    echo "  [ ] No direct XSS reflection"',
+            'fi',
+        ]
+
+        # WordPress-specific
+        if "WordPress" in all_technologies or "wordpress" in " ".join(lib_names).lower():
+            bash_lines += [
+                "",
+                'echo ""',
+                'echo "[*] 6. WordPress checks..."',
+                'curl -s "$BASE/wp-json/wp/v2/users" | python3 -m json.tool 2>/dev/null | grep -E \'"name"|"slug"\' | head -10',
+                'CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/xmlrpc.php")',
+                'echo "  xmlrpc.php: HTTP $CODE"',
+                'curl -s "$BASE/" | grep -i "generator" | head -3',
+            ]
+
+        # Source map checks
+        if all_src_maps:
+            bash_lines += [
+                "",
+                'echo ""',
+                'echo "[*] 7. Source map checks..."',
+            ]
+            for sm in all_src_maps[:3]:
+                bash_lines.append(f'CODE=$(curl -s -o /dev/null -w "%{{http_code}}" "{sm}")')
+                bash_lines.append(f'echo "  {sm.split("/")[-1]}: HTTP $CODE"')
+
+        # API endpoint checks
+        if all_constructors:
+            bash_lines += [
+                "",
+                'echo ""',
+                'echo "[*] 8. Discovered API endpoint checks..."',
+            ]
+            for c in all_constructors[:5]:
+                ep = c["endpoint"].rstrip("*")
+                bash_lines.append(f'CODE=$(curl -s -o /dev/null -w "%{{http_code}}" "https://{domain}{ep}")')
+                bash_lines.append(f'echo "  {ep}: HTTP $CODE"')
+
+        bash_lines += [
+            "",
+            'echo ""',
+            'echo "[*] Scan complete."',
+            'echo "    Check any [!!!] or [!] lines above for findings worth reporting."',
+            "",
+        ]
+
+        with open(script_path, "w") as sf:
+            sf.write("\n".join(bash_lines))
+        import os
+        os.chmod(script_path, 0o755)
+
+        print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+        print(f"  {FG_SUCCESS}RECON SCRIPT SAVED{RESET}")
+        print(f"  {FG_DIM}A ready-to-run bash recon script was saved to:{RESET}")
+        print(f"  {FG_URL}  {script_path}{RESET}")
+        print(f"  {FG_DIM}Run it with:{RESET}")
+        print(f"  {FG_SUCCESS}  bash {script_path}{RESET}\n")
+
+    except Exception as e:
+        pass  # script saving is best-effort
+
+    # ── FINAL RECOMMENDATION ──────────────────────────────────────────────
+    print(f"  {FG_DIM}{'─'*min(w-2,68)}{RESET}")
+    if crit_secrets:
+        print(f"  {FG_CRITICAL}PRIORITY ACTION: Verify the critical secrets found above.")
+        print(f"  {FG_CRITICAL}If active credentials: report as Critical — high bounty potential.{RESET}")
+    elif high_secrets or worth_files:
+        print(f"  {FG_HIGH}PRIORITY ACTION: Manually verify the high findings above.")
+        print(f"  {FG_HIGH}Run the generated recon script and focus on the flagged endpoints.{RESET}")
+    elif all_lib:
+        print(f"  {FG_DIM}RECOMMENDATION: JS files are all safe libraries.")
+        print(f"  {FG_DIM}These contain no backend logic, secrets, or exploitable patterns.")
+        print(f"  {FG_DIM}Run the generated recon script to test the backend directly.")
+        print(f"  {FG_DIM}If this is a WordPress site: check plugins, user enumeration, xmlrpc.")
+        print(f"  {FG_SUCCESS}Tip: For better targets use JSReaper on apps with custom JS (React SPAs,")
+        print(f"  {FG_SUCCESS}admin panels, dashboards) — those have real secrets and endpoints.{RESET}")
     else:
-        print(f"  {FG_SUCCESS}  RECOMMENDATION: Move on to backend recon using the steps above.")
-        print(f"  {FG_SUCCESS}  These JS files reveal nothing sensitive on their own.{RESET}")
+        print(f"  {FG_DIM}RECOMMENDATION: Nothing critical in JS. Run the recon script above.")
+        print(f"  {FG_DIM}Focus on backend: .git, .env, API endpoints, admin panels.{RESET}")
     print()
 
     return {
@@ -3366,6 +3604,7 @@ def generate_executive_summary(domain, all_analysis, base_url, session):
         "all_constructors": all_constructors,
         "technologies":     list(all_technologies),
         "total_score":      total_score,
+        "recon_script":     script_path,
     }
 
 
