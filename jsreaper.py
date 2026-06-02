@@ -38,7 +38,7 @@ from urllib.parse import urljoin, urlparse
 from collections import defaultdict
 import threading
 
-TOOL_VERSION = "2.5"
+TOOL_VERSION = "2.6"
 TOOL_NAME    = "JSReaper"
 
 # GitHub URLs used by --version and --update
@@ -472,181 +472,131 @@ RISKY_VERSIONS = {
 
 SENSITIVE_PATTERNS = {
 
-    "API Keys & Tokens": [
-        (r'api[_\-\s]?key[\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{16,})["\']?',      "high"),
-        (r'apikey[\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{16,})["\']?',               "high"),
-        (r'api[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{16,})["\']?',      "high"),
-        (r'access[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?', "high"),
-        (r'auth[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?',   "high"),
-        (r'bearer\s+([A-Za-z0-9_\-\.]{20,})',                                   "high"),
-        (r'x-api-key[\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{16,})["\']?',           "high"),
-    ],
+    # ── REAL SECRETS — these have unique formats, near-zero false positives ──
+    # Every pattern here requires a specific credential FORMAT, not just a word.
 
     "AWS Credentials": [
-        (r'AKIA[0-9A-Z]{16}',                                                    "critical"),
-        (r'aws[_\-]?access[_\-]?key[_\-]?id[\s]*[=:]\s*["\']?([A-Z0-9]{20})["\']?',      "critical"),
-        (r'aws[_\-]?secret[_\-]?access[_\-]?key[\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?', "critical"),
-        (r'aws[_\-]?session[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{100,})["\']?',   "critical"),
-        # amazonaws.com alone removed — noise. Only actual keys are reported.
-        (r's3\.amazonaws\.com/([A-Za-z0-9_\-\.]{4,})',                          "low"),   # bucket name ref — low until verified accessible
+        # AKIA format is globally unique — if you see this it IS an AWS key
+        (r'(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}', "critical"),
+        # Secret key needs BOTH the variable name AND a 40-char base64 value
+        (r'aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*["\']([A-Za-z0-9/+=]{40})["\']', "critical"),
+        # MWS token has a very specific UUID-like format
+        (r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', "critical"),
     ],
 
-    "Authentication & Passwords": [
-        (r'password[\s]*[=:]\s*["\']([^"\']{4,})["\']',                        "high"),
-        (r'passwd[\s]*[=:]\s*["\']([^"\']{4,})["\']',                          "high"),
-        (r'secret[\s]*[=:]\s*["\']([^"\']{8,})["\']',                          "high"),
-        (r'client[_\-]?secret[\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?',"critical"),
-        (r'private[_\-]?key[\s]*[=:]\s*["\']([^"\']{8,})["\']',               "critical"),
-        (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----',                             "critical"),
-        (r'jwt[_\-]?secret[\s]*[=:]\s*["\']([^"\']{8,})["\']',                "critical"),
+    "Payment & Commerce Keys": [
+        # Stripe — sk_live_ prefix is unique and only appears in real secret keys
+        (r'sk_live_[0-9a-zA-Z]{24,}',                                  "critical"),
+        (r'rk_live_[0-9a-zA-Z]{24,}',                                  "critical"),
+        # pk_live_ is the publishable key — less critical but still real
+        (r'pk_live_[0-9a-zA-Z]{24,}',                                  "high"),
+        # Braintree — very specific format
+        (r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',     "critical"),
+        # Square — sq0csp prefix is unique
+        (r'sq0csp-[0-9A-Za-z\-_]{43}',                                 "critical"),
     ],
 
-    "OAuth & SSO": [
-        (r'client[_\-]?id[\s]*[=:]\s*["\']([A-Za-z0-9_\-\.]{8,})["\']',      "medium"),
-        (r'oauth[_\-]?token[\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?',  "high"),
-        (r'refresh[_\-]?token[\s]*[=:]\s*["\']([^"\']{16,})["\']',            "high"),
-        (r'redirect[_\-]?uri[\s]*[=:]\s*["\']([^"\']+)["\']',                 "medium"),
+    "Communication & Messaging Keys": [
+        # SendGrid — SG. prefix + exactly 69 chars
+        (r'SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}',               "critical"),
+        # Twilio — SK prefix + 32 hex chars
+        (r'SK[0-9a-fA-F]{32}',                                          "high"),
+        # Slack webhook — very specific URL format
+        (r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,}/[A-Za-z0-9]{20,}', "critical"),
+        # Slack token — xox prefix
+        (r'xox[baprs]-[0-9]{12}-[0-9A-Za-z\-]{10,}',                  "critical"),
     ],
 
-    "Database Credentials": [
-        (r'db[_\-]?password[\s]*[=:]\s*["\']([^"\']+)["\']',                  "critical"),
-        (r'database[_\-]?url[\s]*[=:]\s*["\']([^"\']+)["\']',                 "high"),
-        (r'mongodb(\+srv)?://[^\s"\'<]+',                                       "high"),
-        (r'mysql://[^\s"\'<]+',                                                 "high"),
-        (r'postgresql://[^\s"\'<]+',                                            "high"),
-        (r'redis://[^\s"\'<]+',                                                 "medium"),
-        (r'connection[_\-]?string[\s]*[=:]\s*["\']([^"\']+)["\']',            "high"),
+    "Source Control & CI Keys": [
+        # GitHub — these prefixes are unique and not found in any other context
+        (r'ghp_[A-Za-z0-9]{36,}',                                      "critical"),
+        (r'gho_[A-Za-z0-9]{36,}',                                      "critical"),
+        (r'ghu_[A-Za-z0-9]{36,}',                                      "critical"),
+        (r'ghs_[A-Za-z0-9]{36,}',                                      "critical"),
+        (r'github_pat_[A-Za-z0-9_]{82,}',                              "critical"),
+        # NPM token
+        (r'npm_[A-Za-z0-9]{36,}',                                      "critical"),
     ],
 
-    "Cloud & Infrastructure": [
-        (r'firebase[A-Za-z]*[\s]*[=:]\s*["\']([^"\']{10,})["\']',             "high"),
-        (r'firebaseConfig\s*=\s*\{([^}]+)\}',                                  "high"),
-        (r'google[_\-]?api[_\-]?key[\s]*[=:]\s*["\']([A-Za-z0-9_\-]{30,})["\']', "high"),
-        (r'AIza[0-9A-Za-z\-_]{35}',                                             "high"),
-        (r'azure[_\-]?key[\s]*[=:]\s*["\']([^"\']{10,})["\']',                "high"),
-        (r'sk_live_[A-Za-z0-9]{24,}',                                           "critical"),
-        (r'pk_live_[A-Za-z0-9]{24,}',                                           "high"),
-        (r'SG\.[A-Za-z0-9_\-\.]{40,}',                                          "high"),
-        (r'twilio[_\-]?auth[_\-]?token[\s]*[=:]\s*["\']([A-Za-z0-9]{32})["\']', "high"),
-        (r'heroku[_\-]?api[_\-]?key[\s]*[=:]\s*["\']([A-Za-z0-9\-]{36})["\']',  "high"),
-        (r'digitalocean[_\-]?token[\s]*[=:]\s*["\']([A-Za-z0-9]{64})["\']',   "high"),
+    "Cloud Platform Keys": [
+        # Google API key — AIza prefix is unique
+        (r'AIza[0-9A-Za-z\-_]{35}',                                     "critical"),
+        # Google OAuth token
+        (r'ya29\.[0-9A-Za-z\-_]{40,}',                                  "critical"),
+        # GCP service account
+        (r'"type"\s*:\s*"service_account"',                              "critical"),
+        # Firebase config block — contains real project credentials
+        (r'firebaseConfig\s*=\s*\{[^}]{30,}\}',                         "high"),
+        # Shopify tokens
+        (r'shpat_[A-Za-z0-9]{32}',                                      "critical"),
+        (r'shppa_[A-Za-z0-9]{32}',                                      "critical"),
+        # OpenAI / Anthropic
+        (r'sk-[A-Za-z0-9]{48}',                                         "critical"),
+        (r'sk-ant-[A-Za-z0-9_\-]{93,}',                                 "critical"),
     ],
 
-    "Sensitive Endpoints & Paths": [
-        # INFO by default — a path string in JS is NOT a finding.
-        # Use --verify to probe these and upgrade confirmed ones.
-        (r'["\']/?admin["\'/]',                "info"),
-        (r'["\']/?api/v[0-9]+[/"\' a-zA-Z]',  "info"),
-        (r'["\']/?internal[/"\' a-zA-Z]',      "info"),
-        (r'["\']/?debug[/"\' a-zA-Z]',         "info"),
-        (r'["\']/?swagger[/"\' a-zA-Z]',       "info"),
-        (r'["\']/?graphql[/"\' a-zA-Z]',       "info"),
-        (r'["\']/?[.]git[/"\' a-zA-Z]',        "medium"),
-        (r'["\']/?[.]env[/"\' a-zA-Z]',        "medium"),
-        (r'["\']/?backup[s]?[/"\' a-zA-Z]',   "info"),
-        (r'["\']/?phpmyadmin[/"\' a-zA-Z]',   "medium"),
-        (r'/etc/passwd',                            "critical"),
-        (r'/etc/shadow',                            "critical"),
+    "Private Keys & Certificates": [
+        # PEM blocks — always real, format is globally unique
+        (r'-----BEGIN RSA PRIVATE KEY-----',                             "critical"),
+        (r'-----BEGIN EC PRIVATE KEY-----',                              "critical"),
+        (r'-----BEGIN OPENSSH PRIVATE KEY-----',                        "critical"),
+        (r'-----BEGIN PGP PRIVATE KEY BLOCK-----',                      "critical"),
+        (r'-----BEGIN DSA PRIVATE KEY-----',                             "critical"),
     ],
 
-    # High-impact vulnerability INDICATORS (static analysis — not active testing)
-    # These flag patterns in JS code that suggest a vulnerability MAY exist.
-    # They are indicators for manual follow-up, not confirmed exploits.
-    "High-Impact Indicators": [
-        # SQL injection indicators — unsanitized input in query strings
-        (r'["\']SELECT\s+.+FROM\s+["\']?\s*\+',                       "critical"),
-        (r'query\s*[=:+]\s*["\'].*WHERE\s+.*["\']?\s*\+\s*(?:req|param|input|user)', "critical"),
-        (r'execute\s*\(\s*["\'].*\+',                                   "high"),
-        (r'\.query\s*\(\s*`[^`]*\$\{',                                 "high"),   # template literal in SQL
-        # RCE indicators — dangerous function calls with user input
-        (r'eval\s*\(\s*(?:req|request|param|input|user|data)',         "critical"),
-        (r'child_process',                                              "high"),
-        (r'exec\s*\(\s*["\'].*\+',                                     "high"),
-        (r'spawn\s*\(',                                                 "medium"),
-        (r'require\s*\(\s*(?:req|request|param|user)',                 "critical"),  # dynamic require
-        # IDOR indicators — direct object references without authorization checks
-        (r'[?&]id\s*=\s*(?:req|request|param|user)\.',                "high"),
-        (r'getUserById\s*\(',                                           "medium"),
-        (r'\.findById\s*\(\s*req\.',                                   "high"),
-        (r'params\.id\b',                                              "medium"),
-        # SSRF indicators
-        (r'fetch\s*\(\s*(?:req|request|param|user|input)',             "high"),
-        (r'axios\.(get|post)\s*\(\s*(?:req|request|param)',           "high"),
-        (r'url\s*=\s*req\.',                                           "high"),
-        # Path traversal
-        (r'\.\./',                                                     "medium"),
-        (r'readFile\s*\(\s*(?:req|param|user|input)',                  "high"),
-        (r'path\.join\s*\(\s*[^)]*(?:req|param|user)',                "high"),
+    "Auth Tokens (Format-Verified)": [
+        # JWT — three base64 parts separated by dots, starts with eyJ
+        # This format is globally unique — it IS a JWT if it matches
+        (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9._\-]{10,}\.[A-Za-z0-9_\-]{10,}', "high"),
+        # Bearer token hardcoded inline in code (not from env var)
+        (r'Authorization["\']?\s*:\s*["\']Bearer\s+([A-Za-z0-9_\-\.]{40,})["\']', "high"),
+        # Basic auth hardcoded (base64 of user:pass)
+        (r'Authorization["\']?\s*:\s*["\']Basic\s+([A-Za-z0-9+/=]{20,})["\']', "high"),
+        # URL with credentials embedded — user:pass@host
+        (r'https?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{6,}@[A-Za-z0-9\-\.]+\.[a-z]{2,}', "critical"),
     ],
 
-    "OWASP / Security Issues": [
-        # eval() only matters if it takes user-controlled input
-        # bare eval() in minified/library code is common and usually safe
-        (r'eval\s*\(\s*(?!function|\()',                   "medium"),  # eval() with non-function arg
-        # innerHTML is only dangerous with user input — alone it is INFO
-                (r'innerHTML\s*=\s*[^"\'][^;]{0,80}(?:req|param|location|hash|search|input|user)', "high"),  # XSS: user input → innerHTML
-        (r'innerHTML\s*=',                                  "info"),    # generic — needs context
-        (r'document\.write\s*\(',                          "info"),    # common in old code, not always vuln
-        (r'\.dangerouslySetInnerHTML',                     "medium"),  # React XSS risk
-        (r'localStorage\.setItem\s*\(',                   "info"),
-        (r'sessionStorage\.setItem\s*\(',                 "info"),
-        # console.log with sensitive keywords is worth noting
-        (r'console\.(?:log|error|warn|info)\s*\(.*?(?:password|passwd|secret|private_key|access_key)', "medium"),
-        (r'debugger;',                                      "info"),
-        # open redirect only if URL comes from user input
-        (r'window\.location\s*=\s*[^;]+(?:param|req|input|location\.search|hash)', "high"),
-        (r'window\.location\s*=',                         "info"),    # without user input context = info
-        # CORS wildcard is a real finding
-        (r'Access-Control-Allow-Origin["\'\s:]*\*',        "medium"),
-        (r'document\.cookie',                              "info"),    # access alone is not vuln
-        # dynamic src with user input = real finding
-        (r'\.src\s*=\s*[^;]*(?:param|req|input|location|hash)', "high"),
-        (r'\.src\s*=\s*[^;]*\+',                        "info"),    # concatenation but no clear user input
+    "Database Connection Strings": [
+        # Full connection URLs with credentials — these are always real
+        (r'mongodb(\+srv)?://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}', "critical"),
+        (r'mysql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',           "critical"),
+        (r'postgresql://[A-Za-z0-9_\-\.]+:[A-Za-z0-9_\-\.!@#$%]{4,}@[^\s"\'<]{8,}',      "critical"),
+        (r'redis://:[A-Za-z0-9_\-\.!@#$%]{6,}@[^\s"\'<]{8,}',                             "high"),
+        # DB password explicitly assigned a non-empty value
+        (r'db[_\-]?pass(?:word)?\s*[=:]\s*["\']([^"\']{8,})["\']',                        "high"),
     ],
 
-    "Internal Infrastructure": [
-        (r'192\.168\.\d+\.\d+',                         "medium"),
-        (r'10\.\d+\.\d+\.\d+',                          "medium"),
-        (r'172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+',     "medium"),
-        (r'localhost:\d+',                               "medium"),
-        (r'127\.0\.0\.1',                               "medium"),
-        (r'staging\.[a-z0-9\-]+\.[a-z]+',              "info"),
-        (r'dev\.[a-z0-9\-]+\.[a-z]+',                  "info"),
-        (r'test\.[a-z0-9\-]+\.[a-z]+',                 "info"),
-        (r'internal\.[a-z0-9\-]+\.[a-z]+',             "medium"),
+    "Hardcoded Credentials (High Confidence)": [
+        # These require BOTH the variable name AND a high-entropy value
+        # Short/placeholder values are filtered by the confidence engine
+        (r'password\s*[=:]\s*["\']([^"\']{8,})["\']',                  "high"),
+        (r'passwd\s*[=:]\s*["\']([^"\']{8,})["\']',                    "high"),
+        (r'client[_\-]?secret\s*[=:]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', "critical"),
+        (r'jwt[_\-]?secret\s*[=:]\s*["\']([^"\']{12,})["\']',          "critical"),
     ],
 
-    "Hardcoded Usernames": [
-        (r'username[\s]*[=:]\s*["\']([^"\']{3,})["\']',           "medium"),
-        (r'admin[\s]*[=:]\s*["\']([^"\']{3,})["\']',              "high"),
-        (r'root[\s]*[=:]\s*["\']([^"\']{3,})["\']',               "high"),
-        (r'email[\s]*[=:]\s*["\']([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})["\']', "medium"),
+    "Source Maps (Info Disclosure)": [
+        # Source map files referenced in JS — if accessible = full source exposed
+        # This is a REAL finding unlike most pattern matches
+        (r'//[#@]\s*sourceMappingURL=(\S+\.map)',                        "medium"),
     ],
 
-    "Crypto & Hashing": [
-        (r'md5\s*\(',    "low"),    # MD5 is weak but common — low, not medium
-        (r'sha1\s*\(',   "info"),   # SHA1 used everywhere in legacy code
-        # btoa/atob are used constantly for normal encoding, not just secrets
-        # Only flag if they appear to encode something sensitive
-        (r'btoa\s*\([^)]*(?:password|secret|token|key|auth)',  "medium"),
-        (r'atob\s*\([^)]*(?:password|secret|token|key|auth)',  "medium"),
+    "Internal Network Exposure": [
+        # Private IP addresses hardcoded — real finding in any context
+        (r'https?://(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+', "medium"),
+        (r'["\'](?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+["\']', "medium"),
     ],
 
-    "URLs & Subdomains": [
-        # Only report external URLs that look interesting — not every CDN/library URL
-        # Internal/staging subdomains are more interesting than public CDN references
-        (r'https?://(?:staging|dev|test|internal|admin|api|backend|private)\.[a-zA-Z0-9\-\.]+', "info"),
-        (r'https?://(?:10|192\.168|172\.(?:1[6-9]|2[0-9]|3[01]))\.', "medium"),  # internal IPs in URLs
-    ],
-
-    "Version Control & Debug": [
-        (r'sourceMappingURL\s*=\s*(.+\.map)', "medium"),
-        (r'TODO[:\s]',    "info"),
-        (r'FIXME[:\s]',   "info"),
-        (r'HACK[:\s]',    "info"),
-        (r'BUG[:\s]',     "info"),
+    "XSS Sinks with User Input": [
+        # innerHTML only flagged when user-controlled data flows into it
+        (r'innerHTML\s*=\s*[^"\';\n]{0,60}(?:location\.(?:search|hash)|URLSearchParams|req\.|param|query|input)', "high"),
+        # document.write with user input
+        (r'document\.write\s*\([^)]{0,60}(?:location\.|param|query|input)', "high"),
+        # CORS wildcard — actual misconfiguration
+        (r'Access-Control-Allow-Origin["\'\s:]+\*',                      "medium"),
     ],
 }
+
 
 INTERESTING_EXTENSIONS = [
     ".js", ".mjs", ".jsx", ".ts", ".tsx",
@@ -1041,21 +991,6 @@ def assess_finding_confidence(match_text, context_line, category, severity, sour
     score = 50  # start neutral
 
     # ── EARLY DEFINITIVE FILTERS — checked before anything else ─────────
-
-    # Endpoint-word patterns are INFO until live-verified
-    # "admin" in a string is NOT high severity — it needs an HTTP probe
-    endpoint_only_categories = {"Sensitive Endpoints & Paths"}
-    if category in endpoint_only_categories:
-        # only upgrade if there's real evidence beyond the word
-        has_real_evidence = (
-            re.search(r'AKIA|sk_live_|BEGIN.*KEY|SG\.|ghp_', match_text) or
-            severity == "critical"   # /etc/passwd etc
-        )
-        if not has_real_evidence:
-            result["confidence"]        = "possible"
-            result["adjusted_severity"] = "info"
-            result["fp_reason"]         = "Endpoint string found — INFO until live HTTP probe confirms it exists"
-            return result
 
     # filter: syntax tokens from code editors (ACE, CodeMirror, etc.)
     # token:"entity.other.attribute-name.xml" is a grammar definition, not a credential
