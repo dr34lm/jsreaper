@@ -188,9 +188,10 @@ def box_line(text, color=FG_DIM):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_banner():
-    # Clean upright block-style banner — portrait, bold, readable.
-    # Each letter is 6 rows tall, built from # characters.
-    # Gradient: lemon top, lime middle, mint bottom.
+    # Clean white/colorless upright block-style banner.
+    # Uses only bright white — clean, professional, readable on any terminal.
+    WHITE = "\033[38;5;231m"   # pure bright white
+    DIM   = "\033[38;5;245m"   # subtle gray for subtitle lines
     v = TOOL_VERSION
     rows = [
         "      ######    #####    ######    #######    ####    ######    #######   ######   ",
@@ -200,23 +201,15 @@ def get_banner():
         "   ##   ##          ##  ## ##      ##       ##    ##  ##        ##        ## ##    ",
         "    #####       ####    ##  ##     #######  ##    ##  ##        #######   ##  ##   ",
     ]
-    row_colors = [LEMON, LEMON, LIME, LIME, MINT, MINT]
     out = "\n"
-    for i, row in enumerate(rows):
-        out += row_colors[i] + row + RESET + "\n"
+    for row in rows:
+        out += WHITE + row + RESET + "\n"
     out += "\n"
-    out += GOLD  + "          ⚡  JavaScript Recon & Analysis Tool  v" + v + "\n"
-    out += GRAY  + "          ◈   Linux | macOS | Windows  —  Python 3.7+" + "\n"
-    out += GRAY  + "          ✦   Written by @dr34lm  |  Research & Educational Use Only" + "\n"
+    out += WHITE + "          ⚡  JavaScript Recon & Analysis Tool  v" + v + "\n"
+    out += DIM   + "          ◈   Linux | macOS | Windows  —  Python 3.7+" + "\n"
+    out += DIM   + "          ✦   Written by @dr34lm  |  Research & Educational Use Only" + "\n"
     out += RESET
     return out
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  VERSION CHECKER
-# ═════════════════════════════════════════════════════════════════════════════
-
-LATEST_VERSION_URL  = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
-LATEST_SCRIPT_URL   = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/jsreaper.py"
 
 def check_version():
     """
@@ -2143,6 +2136,89 @@ def print_intelligence_report(domain, analysis_results, session, args):
 #    - GraphQL query variables
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  JS FILE DISCOVERY
+#  Crawls a page and extracts all JavaScript file references three ways:
+#    1. Standard <script src="..."> tags
+#    2. Other tags (link, a, iframe) for non-JS interesting files
+#    3. Raw regex scan of the HTML for any .js reference
+# ═════════════════════════════════════════════════════════════════════════════
+
+def extract_js_from_page(url, session, waf_aware=False):
+    """
+    Crawl a page and extract all JS and interesting file references.
+    Returns (js_files_set, other_files_set, response).
+    Automatically tries HTTPS then HTTP fallback.
+    """
+    js_files    = set()
+    other_files = set()
+
+    url, resp = try_http_fallback(url, session, timeout=15)
+    if not resp:
+        error(f"Could not reach: {url}")
+        return js_files, other_files, None
+
+    waf = detect_waf(resp)
+    if waf:
+        warn(f"WAF detected: {', '.join(waf)}")
+        if waf_aware:
+            warn("WAF-aware mode active — slowing down...")
+
+    if resp.status_code not in [200, 201]:
+        warn(f"HTTP {resp.status_code} for {url}")
+
+    try:
+        soup     = BeautifulSoup(resp.text, "html.parser")
+    except Exception:
+        return js_files, other_files, resp
+
+    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    # method 1: <script src="..."> tags
+    for tag in soup.find_all("script", src=True):
+        src_val  = tag.get("src", "")
+        if not src_val:
+            continue
+        full = urljoin(url, src_val)
+        if ".js" in full.split("?")[0]:
+            js_files.add(full)
+
+    # method 2: other tags for interesting non-JS files
+    for tag in soup.find_all(["link", "a", "iframe", "img"]):
+        href = tag.get("href", "") or tag.get("src", "")
+        if href:
+            full = urljoin(url, href)
+            for ext in INTERESTING_EXTENSIONS:
+                if ext in full.lower() and ext != ".js":
+                    other_files.add(full)
+
+    # method 3: regex scan raw HTML for any .js path not caught above
+    raw = resp.text
+    for pattern in [
+        r'src\s*[=:]\s*["\']([^"\']+\.js(?:\?[^"\']*)?)["\']',
+        r'import\s+[^"\']*["\']([^"\']+\.js)["\']',
+        r'require\s*\(\s*["\']([^"\']+\.js)["\']',
+        r'["\']([/a-zA-Z0-9_\-\.]+\.js(?:\?[a-zA-Z0-9=&_\-\.]+)?)["\']',
+    ]:
+        try:
+            for match in re.finditer(pattern, raw, re.IGNORECASE):
+                path = match.group(1)
+                if path.startswith("//"):
+                    full = "https:" + path
+                elif path.startswith("/"):
+                    full = base_url + path
+                elif path.startswith("http"):
+                    full = path
+                else:
+                    full = urljoin(url, path)
+                if ".js" in full.split("?")[0]:
+                    js_files.add(full)
+        except re.error:
+            continue
+
+    return js_files, other_files, resp
+
+
 def extract_parameters_and_endpoints(content, source_url=""):
     """
     Extract URL parameters, API endpoints, form fields, and function call
@@ -3389,9 +3465,10 @@ def main():
             warn("Ctrl+C — saving partial results...")
             break
         except Exception as e:
+            import traceback
             error(f"Scan failed for {target}: {e}")
-            if args.verbose:
-                import traceback; traceback.print_exc()
+            # always print traceback so user can see exact cause
+            traceback.print_exc()
 
     elapsed = time.time() - start_time
     print(f"\n{FG_SUCCESS}[✓] Done in {elapsed:.1f}s{RESET}")
