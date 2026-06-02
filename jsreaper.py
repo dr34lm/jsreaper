@@ -38,8 +38,12 @@ from urllib.parse import urljoin, urlparse
 from collections import defaultdict
 import threading
 
-TOOL_VERSION = "2.1"
+TOOL_VERSION = "2.3"
 TOOL_NAME    = "JSReaper"
+
+# GitHub URLs used by --version and --update
+LATEST_VERSION_URL = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
+LATEST_SCRIPT_URL  = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/jsreaper.py"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS   = platform.system() == "Darwin"
