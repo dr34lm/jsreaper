@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║                         JSReaper v3.0                               ║
+# ║                         JSReaper v3.1                               ║
 # ║         JavaScript Security Analysis Tool                           ║
 # ║                                                                      ║
 # ║  Written by @dr34lm                                                  ║
@@ -34,7 +34,7 @@ from urllib.parse import urljoin, urlparse, urlencode
 from collections import defaultdict
 import threading
 
-TOOL_VERSION       = "3.0"
+TOOL_VERSION       = "3.1"
 TOOL_NAME          = "JSReaper"
 LATEST_VERSION_URL = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/VERSION"
 LATEST_SCRIPT_URL  = "https://raw.githubusercontent.com/dr34lm/jsreaper/main/jsreaper.py"
@@ -780,6 +780,318 @@ def probe_endpoint(url, session, timeout=8):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  SUBDOMAIN DISCOVERY ENGINE
+#
+#  When the user passes *.target.com or --wild target.com, this engine:
+#    1. Queries crt.sh, HackerTarget, and AlienVault OTX passively
+#    2. Checks each subdomain is alive (HTTP probe)
+#    3. Crawls each live subdomain for JS files
+#    4. Returns the full list of JS files across all subdomains
+#
+#  Passive only — no brute force, no DNS zone transfer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def discover_subdomains(domain, session):
+    """
+    Query three passive sources for subdomains of a domain.
+    Returns a deduplicated sorted set of subdomain strings.
+    """
+    found = set()
+
+    # ── crt.sh — certificate transparency logs ────────────────────────────
+    info("Querying crt.sh (certificate transparency)...")
+    try:
+        r = session.get(
+            f"https://crt.sh/?q=%.{domain}&output=json",
+            timeout=20
+        )
+        if r.status_code == 200:
+            try:
+                for entry in r.json():
+                    for name in entry.get("name_value","").split("\n"):
+                        name = name.strip().lstrip("*.")
+                        if name.endswith(f".{domain}") or name == domain:
+                            found.add(name)
+            except Exception:
+                pass
+            ok(f"  crt.sh: {len(found)} subdomains so far")
+    except Exception as e:
+        warn(f"  crt.sh failed: {e}")
+
+    # ── HackerTarget — passive DNS ────────────────────────────────────────
+    info("Querying HackerTarget (passive DNS)...")
+    try:
+        r = session.get(
+            f"https://api.hackertarget.com/hostsearch/?q={domain}",
+            timeout=15
+        )
+        if r.status_code == 200 and "error" not in r.text.lower():
+            for line in r.text.strip().split("\n"):
+                if "," in line:
+                    sub = line.split(",")[0].strip()
+                    if sub.endswith(f".{domain}") or sub == domain:
+                        found.add(sub)
+            ok(f"  HackerTarget: {len(found)} subdomains so far")
+    except Exception as e:
+        warn(f"  HackerTarget failed: {e}")
+
+    # ── AlienVault OTX — threat intelligence ─────────────────────────────
+    info("Querying AlienVault OTX...")
+    try:
+        r = session.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
+            timeout=15
+        )
+        if r.status_code == 200:
+            for entry in r.json().get("passive_dns", []):
+                hn = entry.get("hostname","")
+                if hn.endswith(f".{domain}") or hn == domain:
+                    found.add(hn)
+            ok(f"  AlienVault OTX: {len(found)} subdomains so far")
+    except Exception as e:
+        warn(f"  AlienVault OTX failed: {e}")
+
+    # always include the root domain itself
+    found.add(domain)
+
+    return sorted(found)
+
+
+def probe_subdomain(sub, session, timeout=8):
+    """
+    Check if a subdomain is alive.
+    Tries HTTPS first, then HTTP.
+    Returns (url, status_code, title) or None if unreachable.
+    """
+    for scheme in ["https", "http"]:
+        url = f"{scheme}://{sub}"
+        try:
+            r = session.get(url, timeout=timeout, verify=False,
+                           allow_redirects=True)
+            if r.status_code < 500:
+                # try to extract page title
+                title = ""
+                try:
+                    tm = re.search(r'<title[^>]*>([^<]{1,80})</title>',
+                                   r.text, re.IGNORECASE)
+                    title = tm.group(1).strip() if tm else ""
+                except Exception:
+                    pass
+                return url, r.status_code, title
+        except Exception:
+            continue
+    return None
+
+
+def scan_wildcard(root_domain, args, session):
+    """
+    Full wildcard scan pipeline:
+      1. Discover all subdomains of root_domain
+      2. Probe each for liveness
+      3. Crawl each live subdomain for JS files
+      4. List all JS files grouped by subdomain
+      5. Optionally analyse each JS file
+    """
+    hdr(f"WILDCARD SCAN: *.{root_domain}", WHITE)
+    print(f"  {DIM}Mode    : Subdomain discovery + JS mapping")
+    print(f"  {DIM}Sources : crt.sh, HackerTarget, AlienVault OTX")
+    print(f"  {DIM}Time    : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}\n")
+
+    # ── step 1: discover subdomains ────────────────────────────────────────
+    hdr("STEP 1 — SUBDOMAIN DISCOVERY", CYAN)
+    subdomains = discover_subdomains(root_domain, session)
+    ok(f"Found {len(subdomains)} unique subdomain(s)")
+    print()
+
+    # ── step 2: probe each subdomain ──────────────────────────────────────
+    hdr("STEP 2 — LIVENESS CHECK", CYAN)
+    info(f"Probing {len(subdomains)} subdomain(s) for HTTP response...")
+    print(f"  {DIM}{'STATUS':<8} {'SUBDOMAIN':<45} TITLE{RESET}")
+    print(f"  {DIM}{'─'*8} {'─'*45} {'─'*25}{RESET}")
+
+    live = []   # list of (url, status, sub)
+
+    def probe_one(sub):
+        result = probe_subdomain(sub, session, timeout=args.timeout)
+        return sub, result
+
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futs = {ex.submit(probe_one, sub): sub for sub in subdomains}
+        for fut in as_completed(futs):
+            sub, result = fut.result()
+            if result:
+                url, status, title = result
+                sc     = STATUS_COLOR.get(status, DIM)
+                icon   = "●" if status < 400 else "🔒" if status in [401,403] else "✗"
+                t_disp = title[:30] if title else ""
+                with print_lock:
+                    print(f"  {sc}{icon} {status:<6}{RESET} "
+                          f"{sc}{sub:<45}{RESET} "
+                          f"{DIM}{t_disp}{RESET}")
+                if status < 500:
+                    live.append((url, status, sub))
+            else:
+                with print_lock:
+                    print(f"  {DIM}✗ dead   {sub}{RESET}")
+
+    print()
+    ok(f"{len(live)} subdomain(s) are alive")
+    print()
+
+    if not live:
+        warn("No live subdomains found. Cannot proceed.")
+        return {}
+
+    # ── step 3: crawl each live subdomain for JS files ────────────────────
+    hdr("STEP 3 — JS FILE DISCOVERY", CYAN)
+    info(f"Crawling {len(live)} live subdomain(s) for JavaScript files...\n")
+
+    all_js_map = {}   # subdomain -> list of JS file URLs
+    total_js   = 0
+
+    def crawl_one(url, sub):
+        js_files, _ = crawl_js_files(url, session)
+        return sub, url, js_files
+
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futs = {ex.submit(crawl_one, url, sub): sub for url, status, sub in live}
+        for fut in as_completed(futs):
+            sub, url, js_files = fut.result()
+            all_js_map[sub] = {
+                "url":      url,
+                "js_files": sorted(js_files),
+            }
+            count = len(js_files)
+            total_js += count
+            color = GREEN if count > 0 else DIM
+            with print_lock:
+                print(f"  {color}{'●' if count>0 else '○'} {sub:<45}{RESET}  "
+                      f"{color}{count} JS file(s){RESET}")
+
+    print()
+    ok(f"Total JS files found across all subdomains: {total_js}")
+    print()
+
+    # ── step 4: display full JS file list ─────────────────────────────────
+    hdr("STEP 4 — JS FILE MAP", WHITE)
+
+    grand_total_js = []
+
+    for sub in sorted(all_js_map.keys()):
+        entry    = all_js_map[sub]
+        js_files = entry["js_files"]
+        if not js_files:
+            continue
+
+        print(f"\n  {CYAN}▸ {sub}  ({len(js_files)} file(s)){RESET}")
+        for jf in js_files:
+            print(f"    {DIM}↳ {jf[:W()-8]}{RESET}")
+            grand_total_js.append(jf)
+
+    print()
+    ok(f"Total: {len(grand_total_js)} JS file(s) across {sum(1 for v in all_js_map.values() if v['js_files'])} subdomain(s)")
+
+    # ── step 5: analyse JS files if --analyze flag set ────────────────────
+    if args.analyze and grand_total_js:
+        hdr("STEP 5 — JS SECURITY ANALYSIS", WHITE)
+        info(f"Analysing {len(grand_total_js)} JS file(s) across all subdomains...")
+        print(f"  {DIM}(Only app files — libraries skipped automatically){RESET}\n")
+
+        all_findings  = []
+        all_endpoints = {}
+
+        def analyse_js(js_url):
+            js_url, resp = fetch_with_fallback(js_url, session)
+            if not resp or not resp.text:
+                return None
+            content = resp.text
+            if args.beautify and HAS_BEAUTIFIER:
+                try:
+                    content = jsbeautifier.beautify(content)
+                except Exception:
+                    pass
+            lib, lib_reason = is_library(js_url, content[:2000])
+            if lib:
+                return {"url": js_url, "is_lib": True, "lib_reason": lib_reason}
+
+            ep_found  = extract_endpoints(content, js_url)
+            sqli      = find_sqli_indicators(content, js_url)
+            path_t    = find_path_traversal(content, js_url)
+            rce       = find_rce_indicators(content, js_url)
+            info_disc = find_info_disclosure(content, js_url)
+            file_findings = sqli + path_t + rce + info_disc
+            for f in file_findings:
+                f["source_file"] = js_url
+                f["domain"]      = domain_of(js_url)
+            return {
+                "url":       js_url,
+                "is_lib":    False,
+                "findings":  file_findings,
+                "endpoints": ep_found,
+            }
+
+        with ThreadPoolExecutor(max_workers=args.threads) as ex:
+            futs = {ex.submit(analyse_js, jf): jf for jf in grand_total_js}
+            for fut in as_completed(futs):
+                res = fut.result()
+                if not res:
+                    continue
+                if res.get("is_lib"):
+                    continue
+                findings = res.get("findings", [])
+                if findings:
+                    print_findings(findings, res["url"], domain_of(res["url"]))
+                all_findings.extend(findings)
+                for ep, meta in res.get("endpoints", {}).items():
+                    if ep not in all_endpoints:
+                        all_endpoints[ep] = meta
+
+        # probe live endpoints
+        if all_endpoints and not args.no_probe:
+            info(f"Probing {min(len(all_endpoints),30)} endpoint(s) live...")
+            probed = []
+            def probe_ep(ep, meta):
+                base = f"https://{root_domain}"
+                full = f"{base}{ep}" if ep.startswith("/") else ep
+                status, size, redir, ms = probe_endpoint(full, session)
+                return {"endpoint":ep,"full_url":full,"status":status,
+                        "size":size,"redirect":redir,"ms":ms,
+                        "params":meta["params"],"method":meta["method"]}
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futs = {ex.submit(probe_ep, ep, meta): ep
+                        for ep, meta in list(all_endpoints.items())[:30]}
+                for fut in as_completed(futs):
+                    probed.append(fut.result())
+            print_endpoints_table(probed, root_domain)
+
+        # summary
+        hdr(f"WILDCARD SCAN SUMMARY: *.{root_domain}", WHITE)
+        crit = [f for f in all_findings if f["severity"]=="critical"]
+        high = [f for f in all_findings if f["severity"]=="high"]
+        med  = [f for f in all_findings if f["severity"]=="medium"]
+        print(f"  {DIM}Subdomains found  :{RESET} {len(subdomains)}")
+        print(f"  {DIM}Subdomains alive  :{RESET} {len(live)}")
+        print(f"  {DIM}JS files found    :{RESET} {len(grand_total_js)}")
+        print(f"  {DIM}Endpoints found   :{RESET} {len(all_endpoints)}")
+        print(f"  {DIM}Total findings    :{RESET} {len(all_findings)}")
+        print(f"  {SEV_BADGE['critical']} CRITICAL {RESET}: {len(crit)}")
+        print(f"  {SEV_BADGE['high']} HIGH     {RESET}: {len(high)}")
+        print(f"  {SEV_BADGE['medium']} MEDIUM   {RESET}: {len(med)}")
+        print()
+
+        if args.output:
+            save(all_findings, all_endpoints, root_domain, args.output, args.format)
+
+    return {
+        "root_domain": root_domain,
+        "subdomains":  subdomains,
+        "live":        live,
+        "js_map":      all_js_map,
+        "total_js":    len(grand_total_js),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  JS FILE CRAWLER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1264,54 +1576,46 @@ def build_parser():
  EXAMPLES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
- Scan a target (crawls the page for JS, then analyses all files):
-   jsreaper -u https://example.com
+ Wildcard scan — discover ALL subdomains, list ALL JS files:
+   jsreaper --wild target.com
+   jsreaper --wild target.com --analyze
+   jsreaper --wild target.com --analyze -o results.json --format json
 
- Scan JS files you found in Burp Suite (paste directly):
+ Single target scan:
+   jsreaper -u https://example.com
+   jsreaper -u https://example.com -o results.txt
+
+ Burp Suite JS list:
+   jsreaper --burp js_files.txt
    jsreaper --burp-paste "https://x.com/a.js,https://x.com/b.js"
 
- Scan from a Burp Suite saved JS list file:
-   jsreaper --burp js_files.txt
+ Speed / stealth control:
+   jsreaper --wild target.com -t 8            (faster)
+   jsreaper --wild target.com --waf-aware     (slow, for WAF targets)
 
- Save results:
-   jsreaper -u https://example.com -o results.txt
-   jsreaper -u https://example.com -o results.json --format json
-
- Faster scan (more threads):
-   jsreaper -u https://example.com -t 8
-
- WAF-protected target (slow, rotating user-agents):
-   jsreaper -u https://example.com --waf-aware
-
- De-minify JS before analysing (better results on SPAs):
-   jsreaper -u https://example.com --beautify
-
- Dump all JS files to disk for manual review:
-   jsreaper -u https://example.com --dump --dump-dir ./js_files
-
- Skip live endpoint probing:
-   jsreaper -u https://example.com --no-probe
+ De-minify before analysis:
+   jsreaper --wild target.com --analyze --beautify
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WHAT IT FINDS
+ WILDCARD MODE  (--wild domain.com)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
- 1. ENDPOINTS — Every API endpoint found in JS, probed live
-    for HTTP status (200/401/403/500 = worth testing)
+ Step 1: Discovers subdomains via crt.sh, HackerTarget, AlienVault OTX
+ Step 2: Probes each subdomain for liveness (HTTP status check)
+ Step 3: Crawls each live subdomain for JS files
+ Step 4: Lists ALL JS files grouped by subdomain
+ Step 5: (optional) Analyses each JS file with --analyze
 
- 2. SQL INJECTION — User-controlled input in SQL queries,
-    template literals with db calls, ORDER BY from params
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ WHAT --analyze FINDS IN JS FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
- 3. PATH TRAVERSAL / LFI — readFile/sendFile/require with
-    user input, path.join with user-controlled variables
-
- 4. RCE — eval()/new Function()/exec()/spawn() with user
-    input, dynamic require(), child_process usage
-
- 5. INFO DISCLOSURE — AWS keys (AKIA format), Stripe live
-    keys (sk_live_), GitHub tokens (ghp_), JWTs, private
-    keys (PEM), database URLs with credentials, Firebase
-    configs, Slack webhooks, and more — all format-verified
+ 1. ENDPOINTS   — Every API endpoint, probed live (200/401/403/500)
+ 2. SQL         — User input in SQL queries, template literals, ORDER BY
+ 3. PATH / LFI  — readFile/path.join/require() with user-controlled paths
+ 4. RCE         — eval()/exec()/spawn() with user input
+ 5. DISCLOSURE  — AWS keys, Stripe keys, GitHub tokens, JWTs, PEM keys,
+                  DB connection strings, Slack webhooks — format-verified
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -1323,12 +1627,20 @@ def build_parser():
     tg.add_argument("--burp",            help="Burp Suite JS file list (file path)")
     tg.add_argument("--burp-paste",      metavar="TEXT",
                                          help="Paste JS URLs directly (comma/newline separated)")
+    tg.add_argument("--wild",            metavar="DOMAIN",
+                                         help="Wildcard scan: discover all subdomains of DOMAIN,\n"
+                                              "crawl each for JS files, list them on screen.\n"
+                                              "Example: --wild target.com\n"
+                                              "         (same as giving *.target.com)")
 
     vg = p.add_argument_group("Version & Updates")
     vg.add_argument("--version","-V",   action="store_true", help="Show version and check for updates")
     vg.add_argument("--update",         action="store_true", help="Update to latest version from GitHub")
 
     sg = p.add_argument_group("Scan Options")
+    sg.add_argument("--analyze",        action="store_true",
+                    help="After listing JS files (wildcard mode), also analyse each one\n"
+                         "for SQL injection, path traversal, RCE, and info disclosure.")
     sg.add_argument("--beautify",       action="store_true",
                     help="De-minify JS before analysing (requires jsbeautifier)")
     sg.add_argument("--no-probe",       action="store_true",
@@ -1366,6 +1678,7 @@ def main():
     args   = parser.parse_args()
 
     session = make_session(waf=args.waf_aware if hasattr(args,'waf_aware') else False)
+    start   = time.time()
 
     if args.version:
         check_version(session)
@@ -1373,6 +1686,22 @@ def main():
 
     if args.update:
         self_update(session)
+        sys.exit(0)
+
+    # ── wildcard mode — full subdomain + JS discovery ──────────────────────
+    if args.wild:
+        # strip leading *. if user typed *.target.com
+        root = args.wild.lstrip("*.").strip()
+        if not root:
+            err("Invalid domain for --wild")
+            sys.exit(1)
+        try:
+            scan_wildcard(root, args, session)
+        except KeyboardInterrupt:
+            warn("Interrupted.")
+        elapsed = time.time() - start
+        ok(f"Done in {elapsed:.1f}s")
+        print(f"\n{DIM}  JSReaper v{TOOL_VERSION} by @dr34lm — for authorized research only{RESET}\n")
         sys.exit(0)
 
     # collect targets
