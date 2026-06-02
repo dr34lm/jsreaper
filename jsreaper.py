@@ -2723,8 +2723,15 @@ def print_analysis(results, show_endpoints=True):
         for risk in results.get("tech_risks", []):
             print(f"  {FG_MEDIUM}  ⚠ {risk['tech']} v{risk['version']} — {risk['note']}{RESET}")
 
+    # per-file reasoning verdict
+    if not results.get("library_file"):
+        file_reasoning = reason_about_file(results)
+        verdict = file_reasoning["verdict"]
+        vcolor  = FG_CRITICAL if "CRITICAL" in verdict else FG_HIGH if "HIGH" in verdict else FG_MEDIUM if "MEDIUM" in verdict else FG_SUCCESS
+        print(f"  {FG_DIM}Verdict:{RESET} {vcolor}{verdict}{RESET}")
+
     if not findings and not results["endpoints"]:
-        print(f"  {FG_SUCCESS}✓ Nothing significant found.{RESET}")
+        print(f"  {FG_SUCCESS}✓ Nothing significant found — moving on.{RESET}")
         return
 
     by_cat = defaultdict(list)
@@ -2953,6 +2960,411 @@ def probe_sensitive_files(base_url, session, threads=5, waf_aware=False):
 #  CORE SCAN ENGINE
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  REASONING ENGINE
+#
+#  This is what makes JSReaper think like a human analyst rather than
+#  a dumb pattern scanner.
+#
+#  For each JS file it gives:
+#    - A clear VERDICT: is this file worth your time?
+#    - A REASONING: why it reached that verdict
+#    - NEXT STEPS: what to actually do based on what was found
+#    - EXECUTIVE SUMMARY: cross-file picture across the whole target
+#
+#  This is what DeepSeek did that other tools don't:
+#    - Recognise library files and say "nothing here, move on"
+#    - Recognise custom app files and say "this is where the bugs are"
+#    - Connect dots across files: "file A shows admin API, file B shows
+#      user ID in URL — together this is an IDOR vector"
+#    - Generate proactive recon steps not in the JS at all
+#      (check .git, .env, directory listing, source maps)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Known public libraries — if ALL files are from this list, tell the user
+# to move on rather than wasting time on safe third-party code
+KNOWN_SAFE_LIBRARIES = {
+    "jquery", "bootstrap", "aos", "swiper", "toastr", "lodash",
+    "moment", "axios", "react", "vue", "angular", "d3", "chart",
+    "leaflet", "three", "gsap", "slick", "select2", "datatables",
+    "fullcalendar", "highlight", "prism", "codemirror", "tinymce",
+    "ckeditor", "socket.io", "popper", "modernizr", "normalize",
+    "lazysizes", "svg-loader", "magnific-popup", "nice-select",
+    "lazysizes", "plugin", "polyfill", "core-js", "regenerator",
+    "babel", "webpack", "fontawesome", "materialize", "bulma",
+    "sweetalert", "animate", "waypoints", "isotope", "masonry",
+    "lightbox", "fancybox", "owl-carousel", "splide", "glide",
+}
+
+def classify_js_file(url, content, size):
+    """
+    Classify a JS file into one of four categories:
+      LIBRARY    — known third-party library, almost nothing to find
+      VENDOR     — bundled vendor chunk, skip most patterns
+      CUSTOM     — application-specific code, high value target
+      UNKNOWN    — can't tell, analyse fully
+    Returns (classification, reason, interest_score 0-10)
+    """
+    filename   = url.split("/")[-1].lower()
+    clean_name = re.sub(r"[-_~.](?:v?\d[\d.]*|min|bundle)", "", filename)
+    clean_name = re.sub(r"[-_~][a-f0-9]{6,}", "", clean_name)
+    clean_name = clean_name.replace(".js","").replace(".chunk","").strip("-_~.")
+
+    # check against known safe library names
+    for lib in KNOWN_SAFE_LIBRARIES:
+        if lib in clean_name or clean_name in lib:
+            return "LIBRARY", f"Known library: {lib}", 1
+
+    # vendor bundle indicators
+    if any(x in url.lower() for x in ["node_vendors", "node_modules", "/vendor/", "/vendors/"]):
+        return "VENDOR", "Webpack vendor bundle", 1
+
+    # webpack chunk with hash but not vendor
+    if re.search(r"[a-f0-9]{8,}\.chunk\.js", filename):
+        return "CUSTOM", "App-specific webpack chunk (contains custom code)", 8
+
+    # script.js, app.js, main.js, index.js = almost always custom
+    if re.match(r"^(script|app|main|index|application|custom|site)\.js$", clean_name):
+        return "CUSTOM", f"Custom application file ({filename})", 9
+
+    # large minified files are likely bundles
+    if size > 500_000:
+        return "VENDOR", f"Very large file ({size:,} bytes) — likely vendor bundle", 2
+
+    return "UNKNOWN", "Could not classify — analysing fully", 5
+
+
+def reason_about_file(res):
+    """
+    Generate a human-readable reasoning about a single JS file analysis.
+    Returns dict with verdict, reason, worth_reporting bool, next_steps list.
+    """
+    url      = res["url"]
+    filename = url.split("/")[-1]
+    findings = res.get("findings", [])
+    score    = res.get("score", 0)
+    is_lib   = res.get("library_file", False)
+    techs    = list(res.get("technologies", {}).keys())
+    prec     = res.get("precision_secrets", [])
+    constrs  = res.get("url_constructors", [])
+    vuln_ind = res.get("vuln_indicators", {})
+    src_maps = res.get("source_maps", [])
+    params   = res.get("parameters", {})
+
+    verdict      = "NOTHING TO REPORT"
+    worth        = False
+    reasons      = []
+    next_steps   = []
+    report_items = []
+
+    # ── library file ──────────────────────────────────────────────────────
+    if is_lib:
+        return {
+            "verdict":      "LIBRARY — SKIP",
+            "worth":        False,
+            "reasons":      [f"{filename} is a known third-party library. "
+                             "Public libraries contain no app-specific secrets or endpoints. "
+                             "Skip this file and move to custom application files."],
+            "next_steps":   [],
+            "report_items": [],
+        }
+
+    # ── precision secrets found ───────────────────────────────────────────
+    critical_secrets = [s for s in prec if s["severity"] == "critical"]
+    high_secrets     = [s for s in prec if s["severity"] == "high"]
+    if critical_secrets:
+        worth = True
+        verdict = "CRITICAL — REPORT IMMEDIATELY"
+        for s in critical_secrets:
+            reasons.append(f"CRITICAL SECRET: {s['service']} credential found at line {s['line']}")
+            report_items.append({
+                "title":    f"Exposed {s['service']} Credential in Client-Side JS",
+                "severity": "critical",
+                "steps":    f"1. Open {url}\n2. Search for: {s['match'][:40]}\n3. Verify credential is active",
+                "impact":   f"Attacker can use this {s['service']} credential to access/abuse the service"
+            })
+    elif high_secrets:
+        worth = True
+        verdict = "HIGH — WORTH INVESTIGATING"
+        for s in high_secrets:
+            reasons.append(f"Potential secret: {s['service']} at line {s['line']}")
+
+    # ── source maps ───────────────────────────────────────────────────────
+    if src_maps:
+        worth = True
+        verdict = verdict if worth else "MEDIUM — WORTH CHECKING"
+        for sm in src_maps:
+            reasons.append(f"Source map referenced: {sm.split('/')[-1]} — if accessible, exposes full unminified source code")
+            next_steps.append(f"GET {sm}")
+            next_steps.append(f"  → 200 response with JSON = source code exposed (reportable as Information Disclosure)")
+            report_items.append({
+                "title":    "Source Map Exposed — Full Source Code Disclosure",
+                "severity": "medium",
+                "steps":    f"1. Visit: {sm}\n2. If JSON response with 'sources' key = confirmed",
+                "impact":   "Full unminified source code exposed, revealing business logic, API keys, and internal architecture"
+            })
+
+    # ── URL constructors ──────────────────────────────────────────────────
+    if constrs:
+        worth = True
+        verdict = verdict if "CRITICAL" in verdict or "HIGH" in verdict else "MEDIUM — API SURFACE EXPOSED"
+        endpoints = [c["endpoint"] for c in constrs[:5]]
+        reasons.append(f"API URL constructor found — app builds endpoints dynamically. "
+                       f"Discovered patterns: {', '.join(endpoints[:3])}")
+        next_steps.append(f"# Test these discovered API endpoints for auth bypass and IDOR:")
+        for c in constrs[:8]:
+            ep = c["endpoint"]
+            next_steps.append(f"GET  https://{get_domain(url)}{ep}")
+            next_steps.append(f"GET  https://{get_domain(url)}{ep}/1")
+            next_steps.append(f"GET  https://{get_domain(url)}{ep}?id=1")
+
+    # ── vulnerability indicators ──────────────────────────────────────────
+    high_vulns = [v for v in vuln_ind if v in ("SQLi", "SSRF", "RCE", "PathTraversal")]
+    med_vulns  = [v for v in vuln_ind if v in ("IDOR", "XSS", "OpenRedirect", "MassAssignment")]
+
+    if high_vulns:
+        worth = True
+        verdict = verdict if "CRITICAL" in verdict else f"HIGH — {', '.join(high_vulns)} INDICATORS"
+        for v in high_vulns:
+            reasons.append(f"{v} indicator in code — user input flows into dangerous function. Needs manual verification.")
+            next_steps.append(f"# Manually review {filename} for {v} — look at line {vuln_ind[v][0]['line']}")
+            next_steps.append(f"  Code: {vuln_ind[v][0]['context'][:80]}")
+
+    if med_vulns and not high_vulns:
+        worth = True
+        verdict = verdict if worth else f"MEDIUM — {', '.join(med_vulns)} INDICATORS"
+        for v in med_vulns:
+            reasons.append(f"{v} code pattern found. May be exploitable depending on server-side handling.")
+
+    # ── sensitive parameters ──────────────────────────────────────────────
+    sensitive_params = params.get("sensitive", []) if params else []
+    if sensitive_params:
+        worth = True
+        for p in sensitive_params[:3]:
+            ep     = p.get("endpoint","")
+            sparams = p.get("sensitive_params",[])
+            reasons.append(f"Sensitive parameter(s) {sparams} found in endpoint {ep}")
+            next_steps.append(f"# Test for IDOR — {ep} with sensitive params: {sparams}")
+            next_steps.append(f"GET  https://{get_domain(url)}{ep}?{'&'.join(f'{p}=1' for p in sparams[:3])}")
+
+    # ── nothing found ─────────────────────────────────────────────────────
+    if not worth:
+        reasons.append(f"{filename} contains no credentials, sensitive endpoints, or vulnerability indicators. "
+                       "This is likely safe library or minified code with no app-specific logic.")
+        verdict = "NOTHING TO REPORT — SKIP"
+
+    return {
+        "verdict":      verdict,
+        "worth":        worth,
+        "reasons":      reasons,
+        "next_steps":   next_steps,
+        "report_items": report_items,
+    }
+
+
+def generate_executive_summary(domain, all_analysis, base_url, session):
+    """
+    Cross-file executive summary — the top-level picture.
+
+    This is what DeepSeek gave at the end:
+    - Overall verdict: worth your time or not?
+    - What the JS files reveal about the backend
+    - Proactive recon steps not in the JS (but logically implied)
+    - Bug bounty reportability assessment
+    """
+    worth_files      = []
+    library_files    = []
+    missing_files    = []
+    all_secrets      = []
+    all_constructors = []
+    all_src_maps     = []
+    all_technologies = set()
+    total_score      = 0
+
+    for res in all_analysis:
+        reasoning = reason_about_file(res)
+        total_score += res.get("score", 0)
+        if res.get("library_file"):
+            library_files.append(res["url"])
+        elif reasoning["worth"]:
+            worth_files.append((res["url"], reasoning))
+        all_secrets.extend(res.get("precision_secrets", []))
+        all_constructors.extend(res.get("url_constructors", []))
+        all_src_maps.extend(res.get("source_maps", []))
+        all_technologies.update(res.get("technologies", {}).keys())
+
+    # check for 404 JS files (broken assets — sometimes interesting)
+    for res in all_analysis:
+        if res.get("size", 0) == 0:
+            missing_files.append(res["url"])
+
+    w = term_width()
+
+    section_header(f"EXECUTIVE SUMMARY: {domain}", LEMON)
+
+    print(f"  {FG_DIM}{'─'*40}")
+    print(f"  FILES ANALYSED{RESET}")
+    print(f"  {FG_DIM}Total JS files   :{RESET} {len(all_analysis)}")
+    print(f"  {FG_DIM}Library files    :{RESET} {FG_DIM}{len(library_files)} (skipped — known safe libraries){RESET}")
+    print(f"  {FG_DIM}App files        :{RESET} {FG_URL}{len(all_analysis) - len(library_files)}{RESET}")
+    print(f"  {FG_DIM}Files with hits  :{RESET} {FG_HIGH}{len(worth_files)}{RESET}")
+    if missing_files:
+        print(f"  {FG_DIM}Missing (404)    :{RESET} {FG_MEDIUM}{len(missing_files)}{RESET}")
+    print()
+
+    # overall verdict
+    if all_secrets:
+        crit = [s for s in all_secrets if s["severity"] == "critical"]
+        if crit:
+            print(f"  {C_CRITICAL} VERDICT: CRITICAL FINDINGS — REPORT IMMEDIATELY {RESET}")
+        else:
+            print(f"  {C_HIGH} VERDICT: HIGH PRIORITY FINDINGS FOUND {RESET}")
+    elif worth_files:
+        print(f"  {C_MEDIUM} VERDICT: INTERESTING FINDINGS — WORTH INVESTIGATING {RESET}")
+    else:
+        print(f"  {FG_SUCCESS}  VERDICT: NO HIGH-VALUE FINDINGS IN JS FILES{RESET}")
+        print(f"  {FG_DIM}  The JS files are standard libraries or contain no sensitive data.{RESET}")
+        print(f"  {FG_DIM}  Real vulnerabilities (if any) are in the backend — see recon steps below.{RESET}")
+    print()
+
+    # tech stack insight
+    if all_technologies:
+        print(f"  {FG_DIM}{'─'*40}")
+        print(f"  TECHNOLOGY STACK DETECTED{RESET}")
+        print(f"  {FG_TECH}{', '.join(sorted(all_technologies))}{RESET}")
+        # give backend inference
+        if "WordPress" in all_technologies:
+            print(f"  {FG_MEDIUM}  → WordPress detected: check /wp-json/wp/v2/users for user enumeration{RESET}")
+            print(f"  {FG_MEDIUM}  → Check for vulnerable plugins: /wp-content/plugins/{RESET}")
+        if "GraphQL" in all_technologies:
+            print(f"  {FG_MEDIUM}  → GraphQL detected: test for introspection at /graphql{RESET}")
+        if "Firebase" in all_technologies:
+            print(f"  {FG_HIGH}  → Firebase detected: check for unauthenticated database rules{RESET}")
+        print()
+
+    # per-file verdicts
+    if worth_files:
+        print(f"  {FG_DIM}{'─'*40}")
+        print(f"  FILE-BY-FILE VERDICTS{RESET}")
+        for file_url, reasoning in worth_files:
+            fname  = file_url.split("/")[-1]
+            vcolor = FG_CRITICAL if "CRITICAL" in reasoning["verdict"] else FG_HIGH if "HIGH" in reasoning["verdict"] else FG_MEDIUM
+            print(f"  {vcolor}▸ {fname}{RESET}")
+            print(f"    {FG_DIM}Verdict:{RESET} {vcolor}{reasoning['verdict']}{RESET}")
+            for r in reasoning["reasons"][:2]:
+                print(f"    {FG_DIM}→ {r[:w-8]}{RESET}")
+            print()
+
+    # proactive recon steps — things NOT in the JS but implied
+    print(f"  {FG_DIM}{'─'*40}")
+    print(f"  PROACTIVE RECON STEPS")
+    print(f"  {FG_DIM}  Based on what was found (and not found), run these checks:{RESET}\n")
+
+    recon = []
+
+    # always check these
+    recon.append(("ALWAYS", "medium",
+                  f"Directory listing check",
+                  f"GET https://{domain}/assets/",
+                  "If server returns file list = Information Disclosure"))
+
+    recon.append(("ALWAYS", "critical",
+                  "Exposed Git repository",
+                  f"GET https://{domain}/.git/HEAD",
+                  "200 response = full source code accessible (Critical)"))
+
+    recon.append(("ALWAYS", "critical",
+                  "Environment file exposed",
+                  f"GET https://{domain}/.env",
+                  "200 response = database credentials, API keys exposed (Critical)"))
+
+    recon.append(("ALWAYS", "high",
+                  "Source maps accessible",
+                  f"GET https://{domain}/assets/frontend/js/script.js.map",
+                  "200 JSON response = full unminified source code"))
+
+    # add source maps from JS files
+    for sm in all_src_maps[:3]:
+        recon.append(("SOURCE MAP", "medium",
+                      "Source map from JS reference",
+                      f"GET {sm}",
+                      "200 JSON = source code exposure"))
+
+    # add API endpoints from constructors
+    for c in all_constructors[:5]:
+        ep = c["endpoint"]
+        recon.append(("API ENDPOINT", "high",
+                      f"Discovered endpoint: {ep}",
+                      f"GET https://{domain}{ep}",
+                      "Test for auth bypass — try without session cookie"))
+
+    # tech-specific checks
+    if "WordPress" in all_technologies:
+        recon.append(("WORDPRESS", "medium",
+                      "User enumeration via REST API",
+                      f"GET https://{domain}/wp-json/wp/v2/users",
+                      "Returns usernames = valid for credential stuffing"))
+        recon.append(("WORDPRESS", "high",
+                      "xmlrpc.php brute force vector",
+                      f"POST https://{domain}/xmlrpc.php",
+                      "Enabled = brute force amplification possible"))
+
+    recon.append(("ALWAYS", "medium",
+                  "Backup files",
+                  f"GET https://{domain}/wp-config.php.bak  (also try .env.backup, config.php.bak)",
+                  "200 = credentials exposed"))
+
+    recon.append(("ALWAYS", "medium",
+                  "Robots.txt — hidden paths",
+                  f"GET https://{domain}/robots.txt",
+                  "Disallowed entries reveal hidden admin/API paths"))
+
+    for category, severity, title, test_url, why in recon:
+        sev_color = FG_CRITICAL if severity=="critical" else FG_HIGH if severity=="high" else FG_MEDIUM
+        badge     = SEVERITY_BADGE.get(severity, "")
+        print(f"  {badge} {severity.upper():<8} {RESET}  {FG_DIM}{title}{RESET}")
+        print(f"    {sev_color}{test_url}{RESET}")
+        print(f"    {FG_DIM}-> {why}{RESET}\n")
+
+    # 404 file note
+    if missing_files:
+        print(f"  {FG_DIM}{'─'*40}")
+        print(f"  MISSING FILES (404) — Usually Not Reportable{RESET}")
+        print(f"  {FG_DIM}  404 errors are NOT bugs unless they reveal directory structure")
+        print(f"  or the missing file was something sensitive (config, backup, etc.).{RESET}")
+        for mf in missing_files[:5]:
+            print(f"    {FG_DIM}✗ {mf.split('/')[-1]}{RESET}")
+        print()
+
+    # final guidance
+    print(f"  {FG_DIM}{'─'*40}")
+    all_lib = len(library_files) == len(all_analysis)
+    if all_lib:
+        print(f"  {FG_DIM}ALL FILES ARE LIBRARIES{RESET}")
+        print(f"  {FG_DIM}  None of these JS files contain application logic.")
+        print(f"  {FG_DIM}  The real attack surface is in the backend — use the recon steps above.")
+        print(f"  {FG_DIM}  Focus on: .git, .env, API endpoints, admin panels.{RESET}")
+    elif all_secrets:
+        print(f"  {FG_HIGH}  HIGH PRIORITY: Verify the secrets found above are active credentials.")
+        print(f"  {FG_HIGH}  If confirmed active = Critical/High severity report.{RESET}")
+    elif worth_files:
+        print(f"  {FG_MEDIUM}  NEXT STEP: Manually review the flagged files and run the test cases above.")
+        print(f"  {FG_MEDIUM}  Use Burp Suite to intercept and test the discovered API endpoints.{RESET}")
+    else:
+        print(f"  {FG_SUCCESS}  RECOMMENDATION: Move on to backend recon using the steps above.")
+        print(f"  {FG_SUCCESS}  These JS files reveal nothing sensitive on their own.{RESET}")
+    print()
+
+    return {
+        "worth_files":      [f for f, _ in worth_files],
+        "library_files":    library_files,
+        "all_secrets":      all_secrets,
+        "all_constructors": all_constructors,
+        "technologies":     list(all_technologies),
+        "total_score":      total_score,
+    }
+
+
 def scan_target(url, args, session):
     url    = normalize_url(url)
     domain = get_domain(url)
@@ -3042,6 +3454,14 @@ def scan_target(url, args, session):
             domain, all_results["analysis"], session, args
         )
         all_results["intelligence_test_cases"] = intel_test_cases or []
+
+        # ── EXECUTIVE SUMMARY — DeepSeek-style reasoning ────────────────
+        # This gives the overall verdict, per-file reasoning, and
+        # proactive recon steps not in the JS but logically implied.
+        exec_summary = generate_executive_summary(
+            domain, all_results["analysis"], url, session
+        )
+        all_results["exec_summary"] = exec_summary
 
         # save intelligence report to output file if requested
         if args.output and intel_test_cases:
